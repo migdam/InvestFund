@@ -70,9 +70,12 @@ plots/
 htmlcov/
 *.cover
 .hypothesis/
+test_output/
+test_output_mocks/
 
 # Logs
 *.log
+test_run.log
 
 # Temporary files
 *.tmp
