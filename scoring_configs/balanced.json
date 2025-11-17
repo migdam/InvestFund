@@ -1,0 +1,11 @@
+{
+  "description": "Balanced scoring - equal emphasis on returns and risk (DEFAULT)",
+  "weights": {
+    "return_6m": 0.25,
+    "return_1y": 0.20,
+    "sharpe_ratio": 0.25,
+    "sortino_ratio": 0.15,
+    "max_drawdown": 0.15
+  },
+  "comment": "This is the default configuration with balanced weights between return metrics (45%) and risk metrics (55%). Suitable for most investors."
+}

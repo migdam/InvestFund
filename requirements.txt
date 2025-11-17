@@ -1,0 +1,26 @@
+# Core dependencies for Polish Funds Analyzer
+# Install with: pip install -r requirements.txt
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Web scraping and HTTP requests
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Statistical analysis
+scipy>=1.11.0
+
+# Visualization (optional but recommended)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Excel export support
+openpyxl>=3.1.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Additional utilities
+python-dateutil>=2.8.0

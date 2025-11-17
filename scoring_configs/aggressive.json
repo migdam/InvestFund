@@ -1,0 +1,11 @@
+{
+  "description": "Aggressive scoring - prioritizes returns over risk",
+  "weights": {
+    "return_6m": 0.35,
+    "return_1y": 0.35,
+    "sharpe_ratio": 0.15,
+    "sortino_ratio": 0.10,
+    "max_drawdown": 0.05
+  },
+  "comment": "This configuration puts 70% weight on returns and only 30% on risk metrics. Suitable for growth-focused investors with higher risk tolerance."
+}

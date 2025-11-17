@@ -1,0 +1,11 @@
+{
+  "description": "Conservative scoring - prioritizes risk management over returns",
+  "weights": {
+    "return_6m": 0.15,
+    "return_1y": 0.15,
+    "sharpe_ratio": 0.20,
+    "sortino_ratio": 0.20,
+    "max_drawdown": 0.30
+  },
+  "comment": "This configuration puts 70% weight on risk metrics (sharpe, sortino, drawdown) and only 30% on raw returns. Suitable for risk-averse investors."
+}

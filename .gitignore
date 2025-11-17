@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project-specific
+# Cache directory for fund data
+.fund_cache/
+
+# Output files from analysis
+funds_analysis.*
+results_*.csv
+results_*.xlsx
+results_*.json
+results_*.html
+*.csv
+*.xlsx
+*.json
+!scoring_configs/*.json
+!requirements.txt
+
+# Plots directory
+plots/
+*.png
+*.jpg
+*.pdf
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak

@@ -1,0 +1,1174 @@
+"""
+analyze_polish_funds.py
+----------------------
+
+Enhanced script for analyzing Polish investment funds from the Stooq financial portal.
+This version includes advanced metrics, parallel processing, caching, and comprehensive
+risk analysis.
+
+Features:
+- Risk-adjusted returns (Sharpe ratio, Sortino ratio)
+- Volatility and drawdown analysis
+- Parallel data downloads for improved performance
+- Smart caching to reduce network requests
+- Multiple export formats (CSV, Excel, JSON, HTML)
+- Interactive visualizations
+- Configurable recommendation engine
+- Statistical analysis and percentile rankings
+
+Background:
+~~~~~~~~~~
+On Stooq's web site each fund is identified by a ticker code such as ``1006.N``.
+Historical data can be downloaded as CSV from ``https://stooq.pl/q/d/l/?s=1006.n&i=d``.
+The main fund listing page at ``https://stooq.pl/t/`` presents all available funds.
+
+This script is designed for informational and educational purposes only – it does not
+constitute professional investment advice. You should consult a qualified financial
+advisor before making any investment decisions.
+
+Requirements:
+============
+pandas, requests, beautifulsoup4, numpy, scipy, matplotlib, seaborn, openpyxl, tqdm
+
+Install with: pip install pandas requests beautifulsoup4 numpy scipy matplotlib seaborn openpyxl tqdm
+"""
+
+import argparse
+import datetime
+import json
+import os
+import pickle
+import sys
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Optional, Dict, Tuple
+from io import StringIO
+
+import numpy as np
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from scipy import stats
+from tqdm import tqdm
+
+# Optional imports for visualization
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    PLOT_AVAILABLE = True
+except ImportError:
+    PLOT_AVAILABLE = False
+    warnings.warn("matplotlib/seaborn not available. Plotting features disabled.")
+
+
+# Constants
+TRADING_DAYS_PER_YEAR = 252
+RISK_FREE_RATE = 0.05  # 5% annual risk-free rate (adjust as needed)
+CACHE_DIR = Path(".fund_cache")
+CACHE_EXPIRY_DAYS = 1  # Cache expires after 1 day
+
+
+@dataclass
+class FundInfo:
+    """Container for fund meta information."""
+    symbol: str
+    name: str
+
+
+@dataclass
+class FundMetrics:
+    """Container for all calculated fund metrics."""
+    symbol: str
+    name: str
+    # Returns
+    return_1m: Optional[float] = None
+    return_3m: Optional[float] = None
+    return_6m: Optional[float] = None
+    return_1y: Optional[float] = None
+    return_ytd: Optional[float] = None
+    # Risk metrics
+    volatility: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+    sortino_ratio: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    calmar_ratio: Optional[float] = None
+    # Statistical
+    skewness: Optional[float] = None
+    kurtosis: Optional[float] = None
+    var_95: Optional[float] = None  # Value at Risk 95%
+    cvar_95: Optional[float] = None  # Conditional VaR
+    # Recommendation
+    recommendation: str = "Hold"
+    score: float = 0.0
+    percentile_rank: Optional[float] = None
+
+
+class FundAnalyzer:
+    """Main class for analyzing Polish investment funds."""
+
+    def __init__(self, use_cache: bool = True, cache_dir: Path = CACHE_DIR):
+        """
+        Initialize the analyzer.
+
+        Parameters
+        ----------
+        use_cache : bool
+            Whether to use caching for downloaded data
+        cache_dir : Path
+            Directory for cache storage
+        """
+        self.use_cache = use_cache
+        self.cache_dir = cache_dir
+        if use_cache:
+            self.cache_dir.mkdir(exist_ok=True)
+
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/118.0 Safari/537.36"
+            )
+        }
+
+    def get_fund_list(self, url: str = "https://stooq.pl/t/") -> List[FundInfo]:
+        """
+        Download the master list of funds from Stooq.
+
+        Parameters
+        ----------
+        url : str
+            The URL of the Stooq fund listing
+
+        Returns
+        -------
+        List[FundInfo]
+            A list of fund meta information
+
+        Raises
+        ------
+        RuntimeError
+            If the table cannot be found or parsed
+        """
+        cache_file = self.cache_dir / "fund_list.pkl"
+
+        # Check cache
+        if self.use_cache and cache_file.exists():
+            cache_age = datetime.datetime.now() - datetime.datetime.fromtimestamp(
+                cache_file.stat().st_mtime
+            )
+            if cache_age.days < CACHE_EXPIRY_DAYS:
+                with open(cache_file, "rb") as f:
+                    return pickle.load(f)
+
+        # Download fresh data
+        resp = requests.get(url, headers=self.headers, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Find the table with fund listings
+        table = soup.find("table")
+        while table:
+            headers_row = [th.get_text(strip=True) for th in table.find_all("th")]
+            if "Symbol" in headers_row and "Nazwa" in headers_row:
+                break
+            table = table.find_next("table")
+
+        if not table:
+            raise RuntimeError("Could not locate fund listing table on the page")
+
+        funds = []
+        for tr in table.find_all("tr"):
+            cols = [td.get_text(strip=True) for td in tr.find_all(["th", "td"])]
+            if not cols or cols[0] == "Symbol":
+                continue
+            symbol = cols[0]
+            name = cols[1] if len(cols) > 1 else ""
+            funds.append(FundInfo(symbol=symbol, name=name))
+
+        # Cache the results
+        if self.use_cache:
+            with open(cache_file, "wb") as f:
+                pickle.dump(funds, f)
+
+        return funds
+
+    def download_quotes(self, symbol: str, max_retries: int = 3) -> Optional[pd.DataFrame]:
+        """
+        Fetch historical daily quotes for a given fund symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            Ticker of the fund (e.g. "1006.N")
+        max_retries : int
+            Maximum number of retry attempts
+
+        Returns
+        -------
+        pd.DataFrame or None
+            DataFrame with Date, Open, High, Low, Close, Volume columns
+        """
+        cache_file = self.cache_dir / f"{symbol.replace('.', '_')}.pkl"
+
+        # Check cache
+        if self.use_cache and cache_file.exists():
+            cache_age = datetime.datetime.now() - datetime.datetime.fromtimestamp(
+                cache_file.stat().st_mtime
+            )
+            if cache_age.days < CACHE_EXPIRY_DAYS:
+                with open(cache_file, "rb") as f:
+                    return pickle.load(f)
+
+        # Download with retries
+        url = f"https://stooq.pl/q/d/l/?s={symbol.lower()}&i=d"
+
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, headers=self.headers, timeout=30)
+                resp.raise_for_status()
+
+                csv_data = resp.content.decode("utf-8", errors="ignore")
+                first_line = csv_data.splitlines()[0].lower()
+                has_header = first_line.startswith("date")
+
+                df = pd.read_csv(
+                    StringIO(csv_data),
+                    sep=",",
+                    header=0 if has_header else None,
+                    names=["Date", "Open", "High", "Low", "Close", "Volume"],
+                    parse_dates=["Date"],
+                    dayfirst=False,
+                )
+
+                # Data validation and cleaning
+                df = df.dropna(subset=["Close"])
+                df = df[df["Close"] > 0]  # Remove invalid prices
+                df = df.sort_values("Date").reset_index(drop=True)
+
+                # Cache the results
+                if self.use_cache and len(df) > 0:
+                    with open(cache_file, "wb") as f:
+                        pickle.dump(df, f)
+
+                return df
+
+            except Exception as exc:
+                if attempt == max_retries - 1:
+                    print(f"Warning: failed to fetch {symbol} after {max_retries} attempts: {exc}",
+                          file=sys.stderr)
+                    return None
+
+        return None
+
+    def calculate_returns(self, df: pd.DataFrame) -> Dict[str, Optional[float]]:
+        """
+        Calculate various return metrics.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Historical price data
+
+        Returns
+        -------
+        dict
+            Dictionary with return metrics
+        """
+        if df is None or len(df) < 2:
+            return {
+                "1m": None, "3m": None, "6m": None,
+                "1y": None, "ytd": None
+            }
+
+        def calc_return(days: int) -> Optional[float]:
+            if len(df) <= days:
+                return None
+            end_price = df["Close"].iloc[-1]
+            start_price = df["Close"].iloc[-(days + 1)]
+            if start_price == 0:
+                return None
+            return (end_price - start_price) / start_price
+
+        # Year-to-date return
+        ytd_return = None
+        current_year = datetime.datetime.now().year
+        ytd_data = df[df["Date"].dt.year == current_year]
+        if len(ytd_data) > 1:
+            ytd_return = (ytd_data["Close"].iloc[-1] - ytd_data["Close"].iloc[0]) / ytd_data["Close"].iloc[0]
+
+        return {
+            "1m": calc_return(21),
+            "3m": calc_return(63),
+            "6m": calc_return(126),
+            "1y": calc_return(252),
+            "ytd": ytd_return
+        }
+
+    def calculate_volatility(self, df: pd.DataFrame) -> Optional[float]:
+        """
+        Calculate annualized volatility.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Historical price data
+
+        Returns
+        -------
+        float or None
+            Annualized volatility
+        """
+        if df is None or len(df) < 20:
+            return None
+
+        # Calculate daily returns
+        returns = df["Close"].pct_change().dropna()
+
+        # Annualize the standard deviation
+        return returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+    def calculate_sharpe_ratio(self, df: pd.DataFrame, risk_free_rate: float = RISK_FREE_RATE) -> Optional[float]:
+        """
+        Calculate Sharpe ratio (risk-adjusted return).
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Historical price data
+        risk_free_rate : float
+            Annual risk-free rate
+
+        Returns
+        -------
+        float or None
+            Sharpe ratio
+        """
+        if df is None or len(df) < 252:
+            return None
+
+        returns = df["Close"].pct_change().dropna()
+
+        # Annualized return
+        annual_return = (1 + returns.mean()) ** TRADING_DAYS_PER_YEAR - 1
+
+        # Annualized volatility
+        annual_vol = returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+        if annual_vol == 0:
+            return None
+
+        return (annual_return - risk_free_rate) / annual_vol
+
+    def calculate_sortino_ratio(self, df: pd.DataFrame, risk_free_rate: float = RISK_FREE_RATE) -> Optional[float]:
+        """
+        Calculate Sortino ratio (downside risk-adjusted return).
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Historical price data
+        risk_free_rate : float
+            Annual risk-free rate
+
+        Returns
+        -------
+        float or None
+            Sortino ratio
+        """
+        if df is None or len(df) < 252:
+            return None
+
+        returns = df["Close"].pct_change().dropna()
+
+        # Annualized return
+        annual_return = (1 + returns.mean()) ** TRADING_DAYS_PER_YEAR - 1
+
+        # Downside deviation (only negative returns)
+        negative_returns = returns[returns < 0]
+        if len(negative_returns) == 0:
+            return None
+
+        downside_std = negative_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+        if downside_std == 0:
+            return None
+
+        return (annual_return - risk_free_rate) / downside_std
+
+    def calculate_max_drawdown(self, df: pd.DataFrame) -> Optional[float]:
+        """
+        Calculate maximum drawdown.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Historical price data
+
+        Returns
+        -------
+        float or None
+            Maximum drawdown as a negative percentage
+        """
+        if df is None or len(df) < 2:
+            return None
+
+        prices = df["Close"].values
+        cummax = np.maximum.accumulate(prices)
+        drawdown = (prices - cummax) / cummax
+
+        return drawdown.min()
+
+    def calculate_calmar_ratio(self, df: pd.DataFrame) -> Optional[float]:
+        """
+        Calculate Calmar ratio (return / max drawdown).
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Historical price data
+
+        Returns
+        -------
+        float or None
+            Calmar ratio
+        """
+        if df is None or len(df) < 252:
+            return None
+
+        returns = df["Close"].pct_change().dropna()
+        annual_return = (1 + returns.mean()) ** TRADING_DAYS_PER_YEAR - 1
+
+        max_dd = self.calculate_max_drawdown(df)
+        if max_dd is None or max_dd == 0:
+            return None
+
+        return annual_return / abs(max_dd)
+
+    def calculate_var_cvar(self, df: pd.DataFrame, confidence: float = 0.95) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Calculate Value at Risk and Conditional VaR.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Historical price data
+        confidence : float
+            Confidence level (default 0.95 for 95%)
+
+        Returns
+        -------
+        tuple
+            (VaR, CVaR) both as negative percentages
+        """
+        if df is None or len(df) < 100:
+            return None, None
+
+        returns = df["Close"].pct_change().dropna()
+
+        # VaR: percentile of returns
+        var = np.percentile(returns, (1 - confidence) * 100)
+
+        # CVaR: mean of returns below VaR
+        cvar = returns[returns <= var].mean()
+
+        return var, cvar
+
+    def calculate_statistics(self, df: pd.DataFrame) -> Dict[str, Optional[float]]:
+        """
+        Calculate statistical measures.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Historical price data
+
+        Returns
+        -------
+        dict
+            Dictionary with skewness and kurtosis
+        """
+        if df is None or len(df) < 30:
+            return {"skewness": None, "kurtosis": None}
+
+        returns = df["Close"].pct_change().dropna()
+
+        return {
+            "skewness": stats.skew(returns),
+            "kurtosis": stats.kurtosis(returns)
+        }
+
+    def analyze_fund(self, fund: FundInfo) -> Optional[FundMetrics]:
+        """
+        Perform complete analysis on a single fund.
+
+        Parameters
+        ----------
+        fund : FundInfo
+            Fund information
+
+        Returns
+        -------
+        FundMetrics or None
+            Complete metrics for the fund
+        """
+        df = self.download_quotes(fund.symbol)
+
+        if df is None or len(df) < 20:
+            return None
+
+        # Calculate all metrics
+        returns = self.calculate_returns(df)
+        volatility = self.calculate_volatility(df)
+        sharpe = self.calculate_sharpe_ratio(df)
+        sortino = self.calculate_sortino_ratio(df)
+        max_dd = self.calculate_max_drawdown(df)
+        calmar = self.calculate_calmar_ratio(df)
+        var, cvar = self.calculate_var_cvar(df)
+        stats_metrics = self.calculate_statistics(df)
+
+        metrics = FundMetrics(
+            symbol=fund.symbol,
+            name=fund.name,
+            return_1m=returns["1m"],
+            return_3m=returns["3m"],
+            return_6m=returns["6m"],
+            return_1y=returns["1y"],
+            return_ytd=returns["ytd"],
+            volatility=volatility,
+            sharpe_ratio=sharpe,
+            sortino_ratio=sortino,
+            max_drawdown=max_dd,
+            calmar_ratio=calmar,
+            skewness=stats_metrics["skewness"],
+            kurtosis=stats_metrics["kurtosis"],
+            var_95=var,
+            cvar_95=cvar,
+        )
+
+        return metrics
+
+    def assign_recommendation(self, metrics: FundMetrics,
+                            score_weights: Optional[Dict[str, float]] = None) -> Tuple[str, float]:
+        """
+        Assign recommendation based on multi-factor scoring.
+
+        Parameters
+        ----------
+        metrics : FundMetrics
+            Fund metrics
+        score_weights : dict, optional
+            Custom weights for scoring factors
+
+        Returns
+        -------
+        tuple
+            (recommendation, score)
+        """
+        if score_weights is None:
+            score_weights = {
+                "return_6m": 0.25,
+                "return_1y": 0.20,
+                "sharpe_ratio": 0.25,
+                "sortino_ratio": 0.15,
+                "max_drawdown": 0.15,
+            }
+
+        score = 0.0
+        total_weight = 0.0
+
+        # 6-month return scoring
+        if metrics.return_6m is not None:
+            if metrics.return_6m > 0.15:
+                score += 100 * score_weights["return_6m"]
+            elif metrics.return_6m > 0.10:
+                score += 80 * score_weights["return_6m"]
+            elif metrics.return_6m > 0.05:
+                score += 60 * score_weights["return_6m"]
+            elif metrics.return_6m > 0:
+                score += 40 * score_weights["return_6m"]
+            elif metrics.return_6m > -0.05:
+                score += 20 * score_weights["return_6m"]
+            total_weight += score_weights["return_6m"]
+
+        # 1-year return scoring
+        if metrics.return_1y is not None:
+            if metrics.return_1y > 0.20:
+                score += 100 * score_weights["return_1y"]
+            elif metrics.return_1y > 0.15:
+                score += 80 * score_weights["return_1y"]
+            elif metrics.return_1y > 0.10:
+                score += 60 * score_weights["return_1y"]
+            elif metrics.return_1y > 0:
+                score += 40 * score_weights["return_1y"]
+            elif metrics.return_1y > -0.05:
+                score += 20 * score_weights["return_1y"]
+            total_weight += score_weights["return_1y"]
+
+        # Sharpe ratio scoring
+        if metrics.sharpe_ratio is not None:
+            if metrics.sharpe_ratio > 2.0:
+                score += 100 * score_weights["sharpe_ratio"]
+            elif metrics.sharpe_ratio > 1.5:
+                score += 80 * score_weights["sharpe_ratio"]
+            elif metrics.sharpe_ratio > 1.0:
+                score += 60 * score_weights["sharpe_ratio"]
+            elif metrics.sharpe_ratio > 0.5:
+                score += 40 * score_weights["sharpe_ratio"]
+            elif metrics.sharpe_ratio > 0:
+                score += 20 * score_weights["sharpe_ratio"]
+            total_weight += score_weights["sharpe_ratio"]
+
+        # Sortino ratio scoring
+        if metrics.sortino_ratio is not None:
+            if metrics.sortino_ratio > 2.5:
+                score += 100 * score_weights["sortino_ratio"]
+            elif metrics.sortino_ratio > 2.0:
+                score += 80 * score_weights["sortino_ratio"]
+            elif metrics.sortino_ratio > 1.5:
+                score += 60 * score_weights["sortino_ratio"]
+            elif metrics.sortino_ratio > 1.0:
+                score += 40 * score_weights["sortino_ratio"]
+            elif metrics.sortino_ratio > 0:
+                score += 20 * score_weights["sortino_ratio"]
+            total_weight += score_weights["sortino_ratio"]
+
+        # Max drawdown scoring (less negative is better)
+        if metrics.max_drawdown is not None:
+            if metrics.max_drawdown > -0.05:
+                score += 100 * score_weights["max_drawdown"]
+            elif metrics.max_drawdown > -0.10:
+                score += 80 * score_weights["max_drawdown"]
+            elif metrics.max_drawdown > -0.15:
+                score += 60 * score_weights["max_drawdown"]
+            elif metrics.max_drawdown > -0.20:
+                score += 40 * score_weights["max_drawdown"]
+            elif metrics.max_drawdown > -0.30:
+                score += 20 * score_weights["max_drawdown"]
+            total_weight += score_weights["max_drawdown"]
+
+        # Normalize score
+        if total_weight > 0:
+            score = score / total_weight
+
+        # Assign recommendation
+        if score >= 70:
+            recommendation = "Buy"
+        elif score >= 40:
+            recommendation = "Hold"
+        else:
+            recommendation = "Sell"
+
+        return recommendation, score
+
+    def analyze_funds(self, funds: List[FundInfo], max_workers: int = 10,
+                     score_weights: Optional[Dict[str, float]] = None) -> List[FundMetrics]:
+        """
+        Analyze multiple funds in parallel.
+
+        Parameters
+        ----------
+        funds : List[FundInfo]
+            List of funds to analyze
+        max_workers : int
+            Number of parallel workers
+        score_weights : dict, optional
+            Custom weights for scoring
+
+        Returns
+        -------
+        List[FundMetrics]
+            List of fund metrics
+        """
+        results = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_fund = {
+                executor.submit(self.analyze_fund, fund): fund
+                for fund in funds
+            }
+
+            # Process results with progress bar
+            with tqdm(total=len(funds), desc="Analyzing funds", file=sys.stderr) as pbar:
+                for future in as_completed(future_to_fund):
+                    fund = future_to_fund[future]
+                    try:
+                        metrics = future.result()
+                        if metrics is not None:
+                            # Assign recommendation and score
+                            rec, score = self.assign_recommendation(metrics, score_weights)
+                            metrics.recommendation = rec
+                            metrics.score = score
+                            results.append(metrics)
+                    except Exception as exc:
+                        print(f"Error analyzing {fund.symbol}: {exc}", file=sys.stderr)
+                    finally:
+                        pbar.update(1)
+
+        # Calculate percentile ranks
+        if results:
+            scores = [m.score for m in results]
+            for metrics in results:
+                metrics.percentile_rank = stats.percentileofscore(scores, metrics.score)
+
+        return results
+
+    def create_summary_dataframe(self, results: List[FundMetrics]) -> pd.DataFrame:
+        """
+        Convert results to a pandas DataFrame.
+
+        Parameters
+        ----------
+        results : List[FundMetrics]
+            List of fund metrics
+
+        Returns
+        -------
+        pd.DataFrame
+            Summary DataFrame
+        """
+        data = [asdict(m) for m in results]
+        df = pd.DataFrame(data)
+
+        # Format percentage columns
+        pct_cols = [
+            "return_1m", "return_3m", "return_6m", "return_1y", "return_ytd",
+            "volatility", "max_drawdown", "var_95", "cvar_95"
+        ]
+
+        # Sort by score descending
+        df = df.sort_values("score", ascending=False).reset_index(drop=True)
+
+        return df
+
+    def export_to_csv(self, df: pd.DataFrame, output_path: str):
+        """Export results to CSV."""
+        df.to_csv(output_path, index=False)
+        print(f"Results exported to {output_path}", file=sys.stderr)
+
+    def export_to_excel(self, df: pd.DataFrame, output_path: str):
+        """Export results to Excel with formatting."""
+        try:
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Fund Analysis', index=False)
+
+                # Get the worksheet
+                worksheet = writer.sheets['Fund Analysis']
+
+                # Auto-adjust column widths
+                for idx, col in enumerate(df.columns, 1):
+                    max_length = max(
+                        df[col].astype(str).apply(len).max(),
+                        len(col)
+                    )
+                    worksheet.column_dimensions[chr(64 + idx)].width = min(max_length + 2, 50)
+
+            print(f"Results exported to {output_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Could not export to Excel: {e}", file=sys.stderr)
+
+    def export_to_json(self, df: pd.DataFrame, output_path: str):
+        """Export results to JSON."""
+        df.to_json(output_path, orient='records', indent=2, date_format='iso')
+        print(f"Results exported to {output_path}", file=sys.stderr)
+
+    def export_to_html(self, df: pd.DataFrame, output_path: str):
+        """Export results to HTML with styling."""
+        # Create a styled HTML report
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Polish Funds Analysis Report</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }}
+        h1 {{
+            color: #333;
+            text-align: center;
+        }}
+        .summary {{
+            background: white;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        th {{
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            position: sticky;
+            top: 0;
+        }}
+        td {{
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+        }}
+        tr:hover {{
+            background-color: #f5f5f5;
+        }}
+        .buy {{
+            background-color: #c8e6c9 !important;
+        }}
+        .sell {{
+            background-color: #ffcdd2 !important;
+        }}
+        .hold {{
+            background-color: #fff9c4 !important;
+        }}
+        .metric-positive {{
+            color: #2e7d32;
+        }}
+        .metric-negative {{
+            color: #c62828;
+        }}
+    </style>
+</head>
+<body>
+    <h1>Polish Investment Funds Analysis</h1>
+    <div class="summary">
+        <h2>Summary Statistics</h2>
+        <p><strong>Total Funds Analyzed:</strong> {len(df)}</p>
+        <p><strong>Buy Recommendations:</strong> {len(df[df['recommendation'] == 'Buy'])}</p>
+        <p><strong>Hold Recommendations:</strong> {len(df[df['recommendation'] == 'Hold'])}</p>
+        <p><strong>Sell Recommendations:</strong> {len(df[df['recommendation'] == 'Sell'])}</p>
+        <p><strong>Report Generated:</strong> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    </div>
+"""
+
+        # Convert DataFrame to HTML
+        df_display = df.copy()
+
+        # Format percentage columns
+        pct_cols = [
+            "return_1m", "return_3m", "return_6m", "return_1y", "return_ytd",
+            "volatility", "max_drawdown", "var_95", "cvar_95"
+        ]
+        for col in pct_cols:
+            if col in df_display.columns:
+                df_display[col] = df_display[col].apply(
+                    lambda x: f"{x*100:.2f}%" if pd.notna(x) else "N/A"
+                )
+
+        # Format ratio columns
+        ratio_cols = ["sharpe_ratio", "sortino_ratio", "calmar_ratio", "skewness", "kurtosis"]
+        for col in ratio_cols:
+            if col in df_display.columns:
+                df_display[col] = df_display[col].apply(
+                    lambda x: f"{x:.3f}" if pd.notna(x) else "N/A"
+                )
+
+        # Format score and percentile
+        if "score" in df_display.columns:
+            df_display["score"] = df_display["score"].apply(lambda x: f"{x:.1f}")
+        if "percentile_rank" in df_display.columns:
+            df_display["percentile_rank"] = df_display["percentile_rank"].apply(
+                lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A"
+            )
+
+        table_html = df_display.to_html(index=False, escape=False, classes='data')
+
+        # Add row coloring based on recommendation
+        for rec in ["Buy", "Hold", "Sell"]:
+            table_html = table_html.replace(
+                f"<td>{rec}</td>",
+                f'<td class="{rec.lower()}">{rec}</td>'
+            )
+
+        html += table_html
+        html += """
+    <div class="summary" style="margin-top: 20px;">
+        <p><small><em>Disclaimer: This analysis is for informational and educational purposes only.
+        It does not constitute professional investment advice. Consult a qualified financial advisor
+        before making investment decisions.</em></small></p>
+    </div>
+</body>
+</html>
+"""
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+
+        print(f"HTML report exported to {output_path}", file=sys.stderr)
+
+    def create_visualizations(self, df: pd.DataFrame, output_dir: str = "."):
+        """
+        Create visualization charts.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Results DataFrame
+        output_dir : str
+            Directory for saving plots
+        """
+        if not PLOT_AVAILABLE:
+            print("Plotting libraries not available. Skipping visualizations.", file=sys.stderr)
+            return
+
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+
+        sns.set_style("whitegrid")
+
+        # 1. Return distribution
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # 6-month returns histogram
+        returns_6m = df["return_6m"].dropna() * 100
+        axes[0, 0].hist(returns_6m, bins=30, color='steelblue', edgecolor='black', alpha=0.7)
+        axes[0, 0].axvline(returns_6m.mean(), color='red', linestyle='--', label=f'Mean: {returns_6m.mean():.2f}%')
+        axes[0, 0].set_xlabel('6-Month Return (%)')
+        axes[0, 0].set_ylabel('Frequency')
+        axes[0, 0].set_title('Distribution of 6-Month Returns')
+        axes[0, 0].legend()
+
+        # Recommendation counts
+        rec_counts = df['recommendation'].value_counts()
+        colors = {'Buy': '#4CAF50', 'Hold': '#FFC107', 'Sell': '#F44336'}
+        rec_colors = [colors.get(x, 'gray') for x in rec_counts.index]
+        axes[0, 1].bar(rec_counts.index, rec_counts.values, color=rec_colors, edgecolor='black')
+        axes[0, 1].set_ylabel('Count')
+        axes[0, 1].set_title('Recommendation Distribution')
+
+        # Risk-Return scatter (Sharpe ratio vs Return)
+        valid_data = df.dropna(subset=['return_1y', 'sharpe_ratio'])
+        scatter = axes[1, 0].scatter(
+            valid_data['volatility'] * 100,
+            valid_data['return_1y'] * 100,
+            c=valid_data['sharpe_ratio'],
+            cmap='RdYlGn',
+            s=100,
+            alpha=0.6,
+            edgecolors='black'
+        )
+        axes[1, 0].set_xlabel('Volatility (Annualized %)')
+        axes[1, 0].set_ylabel('1-Year Return (%)')
+        axes[1, 0].set_title('Risk-Return Profile')
+        plt.colorbar(scatter, ax=axes[1, 0], label='Sharpe Ratio')
+
+        # Top 10 funds by score
+        top10 = df.nlargest(10, 'score')
+        axes[1, 1].barh(range(len(top10)), top10['score'], color='steelblue', edgecolor='black')
+        axes[1, 1].set_yticks(range(len(top10)))
+        axes[1, 1].set_yticklabels(top10['symbol'], fontsize=8)
+        axes[1, 1].set_xlabel('Score')
+        axes[1, 1].set_title('Top 10 Funds by Score')
+        axes[1, 1].invert_yaxis()
+
+        plt.tight_layout()
+        plot_path = output_path / "fund_analysis_overview.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        print(f"Visualization saved to {plot_path}", file=sys.stderr)
+        plt.close()
+
+        # 2. Advanced metrics comparison
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # Sharpe vs Sortino
+        valid_data = df.dropna(subset=['sharpe_ratio', 'sortino_ratio'])
+        axes[0, 0].scatter(valid_data['sharpe_ratio'], valid_data['sortino_ratio'],
+                          alpha=0.6, s=80, edgecolors='black')
+        axes[0, 0].set_xlabel('Sharpe Ratio')
+        axes[0, 0].set_ylabel('Sortino Ratio')
+        axes[0, 0].set_title('Sharpe vs Sortino Ratio')
+        axes[0, 0].axhline(0, color='gray', linestyle='--', alpha=0.5)
+        axes[0, 0].axvline(0, color='gray', linestyle='--', alpha=0.5)
+
+        # Max Drawdown distribution
+        dd_data = df['max_drawdown'].dropna() * 100
+        axes[0, 1].hist(dd_data, bins=30, color='coral', edgecolor='black', alpha=0.7)
+        axes[0, 1].axvline(dd_data.mean(), color='red', linestyle='--',
+                          label=f'Mean: {dd_data.mean():.2f}%')
+        axes[0, 1].set_xlabel('Maximum Drawdown (%)')
+        axes[0, 1].set_ylabel('Frequency')
+        axes[0, 1].set_title('Maximum Drawdown Distribution')
+        axes[0, 1].legend()
+
+        # Volatility vs Max Drawdown
+        valid_data = df.dropna(subset=['volatility', 'max_drawdown'])
+        axes[1, 0].scatter(valid_data['volatility'] * 100, valid_data['max_drawdown'] * 100,
+                          alpha=0.6, s=80, edgecolors='black', c='purple')
+        axes[1, 0].set_xlabel('Volatility (%)')
+        axes[1, 0].set_ylabel('Max Drawdown (%)')
+        axes[1, 0].set_title('Volatility vs Maximum Drawdown')
+
+        # Score distribution
+        axes[1, 1].hist(df['score'], bins=30, color='teal', edgecolor='black', alpha=0.7)
+        axes[1, 1].axvline(df['score'].mean(), color='red', linestyle='--',
+                          label=f'Mean: {df["score"].mean():.1f}')
+        axes[1, 1].set_xlabel('Score')
+        axes[1, 1].set_ylabel('Frequency')
+        axes[1, 1].set_title('Score Distribution')
+        axes[1, 1].legend()
+
+        plt.tight_layout()
+        plot_path = output_path / "fund_analysis_metrics.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        print(f"Metrics visualization saved to {plot_path}", file=sys.stderr)
+        plt.close()
+
+
+def main():
+    """Main entry point for the script."""
+    parser = argparse.ArgumentParser(
+        description="Enhanced analysis of Polish investment funds from Stooq",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Analyze top 50 funds and export to CSV
+  python analyze_polish_funds.py --max-funds 50 --output results.csv
+
+  # Analyze all funds with Excel and HTML reports
+  python analyze_polish_funds.py --max-funds 0 --format excel html
+
+  # Disable caching and create visualizations
+  python analyze_polish_funds.py --no-cache --plots
+
+  # Custom scoring weights
+  python analyze_polish_funds.py --score-config custom_weights.json
+        """
+    )
+
+    parser.add_argument(
+        "--max-funds",
+        type=int,
+        default=50,
+        help="Maximum number of funds to analyze (0 for all, default: 50)"
+    )
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="funds_analysis",
+        help="Base path for output files (default: funds_analysis)"
+    )
+
+    parser.add_argument(
+        "--format",
+        nargs='+',
+        choices=['csv', 'excel', 'json', 'html'],
+        default=['csv', 'html'],
+        help="Output format(s) (default: csv html)"
+    )
+
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable caching (always download fresh data)"
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Number of parallel workers for downloading (default: 10)"
+    )
+
+    parser.add_argument(
+        "--plots",
+        action="store_true",
+        help="Generate visualization plots"
+    )
+
+    parser.add_argument(
+        "--score-config",
+        type=str,
+        help="Path to JSON file with custom scoring weights"
+    )
+
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear the cache directory and exit"
+    )
+
+    args = parser.parse_args()
+
+    # Handle cache clearing
+    if args.clear_cache:
+        import shutil
+        if CACHE_DIR.exists():
+            shutil.rmtree(CACHE_DIR)
+            print(f"Cache directory {CACHE_DIR} cleared.", file=sys.stderr)
+        else:
+            print(f"Cache directory {CACHE_DIR} does not exist.", file=sys.stderr)
+        return
+
+    # Load custom scoring weights if provided
+    score_weights = None
+    if args.score_config:
+        try:
+            with open(args.score_config, 'r') as f:
+                score_weights = json.load(f)
+            print(f"Loaded custom scoring weights from {args.score_config}", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Could not load score config: {e}", file=sys.stderr)
+
+    # Initialize analyzer
+    analyzer = FundAnalyzer(use_cache=not args.no_cache)
+
+    # Get fund list
+    print("Downloading list of funds…", file=sys.stderr)
+    funds = analyzer.get_fund_list()
+    print(f"Found {len(funds)} funds.", file=sys.stderr)
+
+    # Limit funds if requested
+    if args.max_funds > 0:
+        funds = funds[:args.max_funds]
+        print(f"Analyzing first {len(funds)} funds.", file=sys.stderr)
+
+    # Analyze funds
+    results = analyzer.analyze_funds(funds, max_workers=args.workers, score_weights=score_weights)
+
+    if not results:
+        print("No funds were successfully analyzed.", file=sys.stderr)
+        return
+
+    # Create DataFrame
+    df = analyzer.create_summary_dataframe(results)
+
+    # Display summary to console
+    print("\n" + "="*80, file=sys.stderr)
+    print("ANALYSIS SUMMARY", file=sys.stderr)
+    print("="*80, file=sys.stderr)
+    print(f"Total funds analyzed: {len(df)}", file=sys.stderr)
+    print(f"Buy recommendations: {len(df[df['recommendation'] == 'Buy'])}", file=sys.stderr)
+    print(f"Hold recommendations: {len(df[df['recommendation'] == 'Hold'])}", file=sys.stderr)
+    print(f"Sell recommendations: {len(df[df['recommendation'] == 'Sell'])}", file=sys.stderr)
+    print("\nTop 10 funds by score:", file=sys.stderr)
+    top10 = df[['symbol', 'name', 'score', 'recommendation', 'return_6m', 'sharpe_ratio']].head(10)
+    print(top10.to_string(index=False), file=sys.stderr)
+    print("="*80 + "\n", file=sys.stderr)
+
+    # Export to requested formats
+    for fmt in args.format:
+        output_path = f"{args.output}.{fmt}"
+        if fmt == 'csv':
+            analyzer.export_to_csv(df, output_path)
+        elif fmt == 'excel':
+            analyzer.export_to_excel(df, output_path)
+        elif fmt == 'json':
+            analyzer.export_to_json(df, output_path)
+        elif fmt == 'html':
+            analyzer.export_to_html(df, output_path)
+
+    # Create visualizations if requested
+    if args.plots:
+        analyzer.create_visualizations(df, output_dir="plots")
+
+
+if __name__ == "__main__":
+    main()
