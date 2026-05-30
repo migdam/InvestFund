@@ -152,14 +152,18 @@ class FundAnalyzer:
         """
         cache_file = self.cache_dir / "fund_list.pkl"
 
-        # Check cache
+        # Check cache (with race condition protection)
         if self.use_cache and cache_file.exists():
-            cache_age = datetime.datetime.now() - datetime.datetime.fromtimestamp(
-                cache_file.stat().st_mtime
-            )
-            if cache_age.days < CACHE_EXPIRY_DAYS:
-                with open(cache_file, "rb") as f:
-                    return pickle.load(f)
+            try:
+                cache_age = datetime.datetime.now() - datetime.datetime.fromtimestamp(
+                    cache_file.stat().st_mtime
+                )
+                if cache_age.days < CACHE_EXPIRY_DAYS:
+                    with open(cache_file, "rb") as f:
+                        return pickle.load(f)
+            except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+                # Cache file was deleted, corrupted, or incomplete - ignore and re-download
+                pass
 
         # Download fresh data
         resp = requests.get(url, headers=self.headers, timeout=30)
@@ -186,10 +190,17 @@ class FundAnalyzer:
             name = cols[1] if len(cols) > 1 else ""
             funds.append(FundInfo(symbol=symbol, name=name))
 
-        # Cache the results
+        # Cache the results (with race condition protection)
         if self.use_cache:
-            with open(cache_file, "wb") as f:
-                pickle.dump(funds, f)
+            try:
+                # Write to temp file first, then atomic rename
+                temp_file = cache_file.with_suffix('.tmp')
+                with open(temp_file, "wb") as f:
+                    pickle.dump(funds, f)
+                temp_file.replace(cache_file)
+            except Exception:
+                # If caching fails, continue without it
+                pass
 
         return funds
 
@@ -211,14 +222,18 @@ class FundAnalyzer:
         """
         cache_file = self.cache_dir / f"{symbol.replace('.', '_')}.pkl"
 
-        # Check cache
+        # Check cache (with race condition protection)
         if self.use_cache and cache_file.exists():
-            cache_age = datetime.datetime.now() - datetime.datetime.fromtimestamp(
-                cache_file.stat().st_mtime
-            )
-            if cache_age.days < CACHE_EXPIRY_DAYS:
-                with open(cache_file, "rb") as f:
-                    return pickle.load(f)
+            try:
+                cache_age = datetime.datetime.now() - datetime.datetime.fromtimestamp(
+                    cache_file.stat().st_mtime
+                )
+                if cache_age.days < CACHE_EXPIRY_DAYS:
+                    with open(cache_file, "rb") as f:
+                        return pickle.load(f)
+            except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+                # Cache file was deleted, corrupted, or incomplete - ignore and re-download
+                pass
 
         # Download with retries
         url = f"https://stooq.pl/q/d/l/?s={symbol.lower()}&i=d"
@@ -229,7 +244,11 @@ class FundAnalyzer:
                 resp.raise_for_status()
 
                 csv_data = resp.content.decode("utf-8", errors="ignore")
-                first_line = csv_data.splitlines()[0].lower()
+                lines = csv_data.splitlines()
+                if not lines:
+                    # Empty response, skip to next retry
+                    continue
+                first_line = lines[0].lower()
                 has_header = first_line.startswith("date")
 
                 df = pd.read_csv(
@@ -246,10 +265,17 @@ class FundAnalyzer:
                 df = df[df["Close"] > 0]  # Remove invalid prices
                 df = df.sort_values("Date").reset_index(drop=True)
 
-                # Cache the results
+                # Cache the results (with race condition protection)
                 if self.use_cache and len(df) > 0:
-                    with open(cache_file, "wb") as f:
-                        pickle.dump(df, f)
+                    try:
+                        # Write to temp file first, then atomic rename
+                        temp_file = cache_file.with_suffix('.tmp')
+                        with open(temp_file, "wb") as f:
+                            pickle.dump(df, f)
+                        temp_file.replace(cache_file)
+                    except Exception:
+                        # If caching fails, continue without it
+                        pass
 
                 return df
 
@@ -295,7 +321,11 @@ class FundAnalyzer:
         current_year = datetime.datetime.now().year
         ytd_data = df[df["Date"].dt.year == current_year]
         if len(ytd_data) > 1:
-            ytd_return = (ytd_data["Close"].iloc[-1] - ytd_data["Close"].iloc[0]) / ytd_data["Close"].iloc[0]
+            start_price_ytd = ytd_data["Close"].iloc[0]
+            if start_price_ytd == 0:
+                ytd_return = None
+            else:
+                ytd_return = (ytd_data["Close"].iloc[-1] - start_price_ytd) / start_price_ytd
 
         return {
             "1m": calc_return(21),
@@ -349,8 +379,8 @@ class FundAnalyzer:
 
         returns = df["Close"].pct_change().dropna()
 
-        # Annualized return
-        annual_return = (1 + returns.mean()) ** TRADING_DAYS_PER_YEAR - 1
+        # Annualized return (arithmetic annualization for Sharpe ratio)
+        annual_return = returns.mean() * TRADING_DAYS_PER_YEAR
 
         # Annualized volatility
         annual_vol = returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
@@ -381,8 +411,8 @@ class FundAnalyzer:
 
         returns = df["Close"].pct_change().dropna()
 
-        # Annualized return
-        annual_return = (1 + returns.mean()) ** TRADING_DAYS_PER_YEAR - 1
+        # Annualized return (arithmetic annualization for Sortino ratio)
+        annual_return = returns.mean() * TRADING_DAYS_PER_YEAR
 
         # Downside deviation (only negative returns)
         negative_returns = returns[returns < 0]
@@ -415,6 +445,11 @@ class FundAnalyzer:
 
         prices = df["Close"].values
         cummax = np.maximum.accumulate(prices)
+
+        # Guard against division by zero if cummax contains zeros
+        if np.any(cummax == 0):
+            return None
+
         drawdown = (prices - cummax) / cummax
 
         return drawdown.min()
@@ -437,7 +472,8 @@ class FundAnalyzer:
             return None
 
         returns = df["Close"].pct_change().dropna()
-        annual_return = (1 + returns.mean()) ** TRADING_DAYS_PER_YEAR - 1
+        # Annualized return (arithmetic annualization for Calmar ratio)
+        annual_return = returns.mean() * TRADING_DAYS_PER_YEAR
 
         max_dd = self.calculate_max_drawdown(df)
         if max_dd is None or max_dd == 0:
@@ -750,6 +786,8 @@ class FundAnalyzer:
     def export_to_excel(self, df: pd.DataFrame, output_path: str):
         """Export results to Excel with formatting."""
         try:
+            from openpyxl.utils import get_column_letter
+
             with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Fund Analysis', index=False)
 
@@ -758,11 +796,16 @@ class FundAnalyzer:
 
                 # Auto-adjust column widths
                 for idx, col in enumerate(df.columns, 1):
-                    max_length = max(
-                        df[col].astype(str).apply(len).max(),
-                        len(col)
-                    )
-                    worksheet.column_dimensions[chr(64 + idx)].width = min(max_length + 2, 50)
+                    try:
+                        col_max = df[col].astype(str).apply(len).max()
+                        # Handle NaN or invalid values
+                        if pd.isna(col_max):
+                            col_max = len(col)
+                        max_length = max(int(col_max), len(col))
+                        worksheet.column_dimensions[get_column_letter(idx)].width = min(max_length + 2, 50)
+                    except (ValueError, TypeError):
+                        # Fallback to column name length
+                        worksheet.column_dimensions[get_column_letter(idx)].width = len(col) + 2
 
             print(f"Results exported to {output_path}", file=sys.stderr)
         except Exception as e:
