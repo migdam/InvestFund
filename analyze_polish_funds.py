@@ -99,6 +99,13 @@ class FundMetrics:
     kurtosis: Optional[float] = None
     var_95: Optional[float] = None  # Value at Risk 95%
     cvar_95: Optional[float] = None  # Conditional VaR
+    # Benchmark-relative (populated only when a benchmark is set)
+    beta: Optional[float] = None  # Sensitivity to benchmark moves
+    alpha: Optional[float] = None  # Annualized CAPM excess return
+    tracking_error: Optional[float] = None  # Annualized std of active returns
+    information_ratio: Optional[float] = None  # Active return / tracking error
+    up_capture: Optional[float] = None  # Share of benchmark up-moves captured
+    down_capture: Optional[float] = None  # Share of benchmark down-moves captured
     # Recommendation
     recommendation: str = "Hold"
     score: float = 0.0
@@ -130,6 +137,40 @@ class FundAnalyzer:
                 "(KHTML, like Gecko) Chrome/118.0 Safari/537.36"
             )
         }
+
+        # Benchmark price data, set via set_benchmark(); enables relative metrics
+        self.benchmark_symbol: Optional[str] = None
+        self.benchmark_df: Optional[pd.DataFrame] = None
+
+    def set_benchmark(self, symbol: str) -> bool:
+        """
+        Download and store a benchmark price series (e.g. a market index).
+
+        Once set, ``analyze_fund`` will compute benchmark-relative metrics
+        (beta, alpha, tracking error, information ratio, up/down capture)
+        for every fund.
+
+        Parameters
+        ----------
+        symbol : str
+            Benchmark ticker on Stooq (e.g. "wig" for the WIG index).
+
+        Returns
+        -------
+        bool
+            True if the benchmark was downloaded successfully, else False.
+        """
+        df = self.download_quotes(symbol)
+        if df is None or len(df) < 60:
+            print(
+                f"Warning: could not load benchmark '{symbol}' "
+                f"(insufficient data); relative metrics disabled.",
+                file=sys.stderr,
+            )
+            return False
+        self.benchmark_symbol = symbol
+        self.benchmark_df = df
+        return True
 
     def get_fund_list(self, url: str = "https://stooq.pl/t/") -> List[FundInfo]:
         """
@@ -534,6 +575,165 @@ class FundAnalyzer:
             "kurtosis": stats.kurtosis(returns)
         }
 
+    def calculate_benchmark_metrics(
+        self, df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None
+    ) -> Dict[str, Optional[float]]:
+        """
+        Calculate metrics that compare a fund against a benchmark.
+
+        Daily returns are aligned on common trading dates (an inner join on
+        Date) so funds and the benchmark that trade on different days are
+        compared fairly.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Fund price data with Date and Close columns.
+        benchmark_df : pd.DataFrame, optional
+            Benchmark price data. Defaults to ``self.benchmark_df``.
+
+        Returns
+        -------
+        dict
+            beta, alpha (annualized), tracking_error (annualized),
+            information_ratio, up_capture, down_capture. Any value may be
+            None when it cannot be computed.
+        """
+        empty = {
+            "beta": None, "alpha": None, "tracking_error": None,
+            "information_ratio": None, "up_capture": None, "down_capture": None,
+        }
+
+        if benchmark_df is None:
+            benchmark_df = self.benchmark_df
+        if df is None or benchmark_df is None:
+            return empty
+
+        # Daily returns keyed by date (normalize to calendar day so series
+        # align even if timestamps carry a time component)
+        fund_ret = df[["Date", "Close"]].copy()
+        fund_ret["Date"] = pd.to_datetime(fund_ret["Date"]).dt.normalize()
+        fund_ret["r"] = fund_ret["Close"].pct_change()
+        bench_ret = benchmark_df[["Date", "Close"]].copy()
+        bench_ret["Date"] = pd.to_datetime(bench_ret["Date"]).dt.normalize()
+        bench_ret["b"] = bench_ret["Close"].pct_change()
+
+        merged = pd.merge(
+            fund_ret[["Date", "r"]], bench_ret[["Date", "b"]], on="Date", how="inner"
+        ).dropna()
+
+        # Need a meaningful overlap to produce stable statistics
+        if len(merged) < 60:
+            return empty
+
+        r = merged["r"].to_numpy()
+        b = merged["b"].to_numpy()
+        rf_daily = RISK_FREE_RATE / TRADING_DAYS_PER_YEAR
+
+        # Beta / alpha from excess returns (CAPM)
+        excess_r = r - rf_daily
+        excess_b = b - rf_daily
+        var_b = np.var(excess_b)
+        if var_b == 0:
+            beta = None
+            alpha = None
+        else:
+            beta = float(np.cov(excess_r, excess_b)[0, 1] / var_b)
+            alpha_daily = excess_r.mean() - beta * excess_b.mean()
+            alpha = float(alpha_daily * TRADING_DAYS_PER_YEAR)
+
+        # Tracking error and information ratio from active returns
+        active = r - b
+        te_daily = active.std(ddof=1)
+        tracking_error = float(te_daily * np.sqrt(TRADING_DAYS_PER_YEAR))
+        if tracking_error == 0:
+            information_ratio = None
+        else:
+            information_ratio = float(
+                (active.mean() * TRADING_DAYS_PER_YEAR) / tracking_error
+            )
+
+        # Up/down capture ratios
+        up = b > 0
+        down = b < 0
+        up_capture = (
+            float(r[up].mean() / b[up].mean())
+            if up.any() and b[up].mean() != 0 else None
+        )
+        down_capture = (
+            float(r[down].mean() / b[down].mean())
+            if down.any() and b[down].mean() != 0 else None
+        )
+
+        return {
+            "beta": beta,
+            "alpha": alpha,
+            "tracking_error": tracking_error,
+            "information_ratio": information_ratio,
+            "up_capture": up_capture,
+            "down_capture": down_capture,
+        }
+
+    def compute_correlation_matrix(
+        self, symbols: List[str], min_overlap: int = 60, high_threshold: float = 0.8
+    ) -> Tuple[Optional[pd.DataFrame], List[Tuple[str, str, float]]]:
+        """
+        Build a return-correlation matrix across funds and flag redundant pairs.
+
+        Highly correlated holdings move together, so holding several of them
+        adds little diversification. This downloads each symbol (cache makes
+        repeats cheap), aligns daily returns on common dates, and reports the
+        correlation matrix plus pairs above ``high_threshold``.
+
+        Parameters
+        ----------
+        symbols : List[str]
+            Fund tickers to compare.
+        min_overlap : int
+            Minimum number of shared trading days required for a pair.
+        high_threshold : float
+            Correlation above which a pair is flagged as redundant.
+
+        Returns
+        -------
+        tuple
+            (correlation DataFrame or None, list of (symbol_a, symbol_b,
+            correlation) sorted by descending correlation).
+        """
+        series = {}
+        for symbol in symbols:
+            df = self.download_quotes(symbol)
+            if df is None or len(df) < min_overlap:
+                continue
+            tmp = df[["Date", "Close"]].copy()
+            # Normalize to calendar day so series from different funds align
+            tmp["Date"] = pd.to_datetime(tmp["Date"]).dt.normalize()
+            s = tmp.set_index("Date")["Close"].pct_change().dropna()
+            if not s.empty:
+                series[symbol] = s
+
+        if len(series) < 2:
+            return None, []
+
+        # Align on common dates; columns with too little overlap drop out
+        returns_df = pd.DataFrame(series).dropna()
+        if len(returns_df) < min_overlap:
+            return None, []
+
+        corr = returns_df.corr()
+
+        # Collect unique upper-triangle pairs above the threshold
+        high_pairs: List[Tuple[str, str, float]] = []
+        cols = list(corr.columns)
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                value = corr.iloc[i, j]
+                if pd.notna(value) and value >= high_threshold:
+                    high_pairs.append((cols[i], cols[j], float(value)))
+
+        high_pairs.sort(key=lambda x: x[2], reverse=True)
+        return corr, high_pairs
+
     def analyze_fund(self, fund: FundInfo) -> Optional[FundMetrics]:
         """
         Perform complete analysis on a single fund.
@@ -563,6 +763,9 @@ class FundAnalyzer:
         var, cvar = self.calculate_var_cvar(df)
         stats_metrics = self.calculate_statistics(df)
 
+        # Benchmark-relative metrics (only when a benchmark has been set)
+        bench = self.calculate_benchmark_metrics(df)
+
         metrics = FundMetrics(
             symbol=fund.symbol,
             name=fund.name,
@@ -580,6 +783,12 @@ class FundAnalyzer:
             kurtosis=stats_metrics["kurtosis"],
             var_95=var,
             cvar_95=cvar,
+            beta=bench["beta"],
+            alpha=bench["alpha"],
+            tracking_error=bench["tracking_error"],
+            information_ratio=bench["information_ratio"],
+            up_capture=bench["up_capture"],
+            down_capture=bench["down_capture"],
         )
 
         return metrics
@@ -1138,6 +1347,21 @@ Examples:
         help="Clear the cache directory and exit"
     )
 
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        default=None,
+        help="Benchmark ticker (e.g. 'wig') to compute relative metrics "
+             "(beta, alpha, tracking error, information ratio, up/down capture)"
+    )
+
+    parser.add_argument(
+        "--correlation",
+        action="store_true",
+        help="Compute a correlation matrix across analyzed funds and flag "
+             "redundant (highly correlated) holdings"
+    )
+
     args = parser.parse_args()
 
     # Handle cache clearing
@@ -1162,6 +1386,13 @@ Examples:
 
     # Initialize analyzer
     analyzer = FundAnalyzer(use_cache=not args.no_cache)
+
+    # Load benchmark for relative metrics, if requested
+    if args.benchmark:
+        print(f"Loading benchmark '{args.benchmark}'…", file=sys.stderr)
+        if analyzer.set_benchmark(args.benchmark):
+            print(f"Benchmark '{args.benchmark}' loaded; computing relative metrics.",
+                  file=sys.stderr)
 
     # Get fund list
     print("Downloading list of funds…", file=sys.stderr)
@@ -1211,6 +1442,26 @@ Examples:
     # Create visualizations if requested
     if args.plots:
         analyzer.create_visualizations(df, output_dir="plots")
+
+    # Correlation / diversification report if requested
+    if args.correlation:
+        print("\nComputing correlation across analyzed funds…", file=sys.stderr)
+        symbols = [m.symbol for m in results]
+        corr, high_pairs = analyzer.compute_correlation_matrix(symbols)
+        if corr is None:
+            print("Not enough overlapping data to compute correlations.", file=sys.stderr)
+        else:
+            corr_path = f"{args.output}_correlation.csv"
+            corr.to_csv(corr_path)
+            print(f"Correlation matrix written to {corr_path}", file=sys.stderr)
+            if high_pairs:
+                print("\nHighly correlated pairs (>=0.80) — limited diversification:",
+                      file=sys.stderr)
+                for sym_a, sym_b, value in high_pairs[:20]:
+                    print(f"  {sym_a} ~ {sym_b}: {value:.2f}", file=sys.stderr)
+            else:
+                print("No highly correlated pairs found (good diversification).",
+                      file=sys.stderr)
 
 
 if __name__ == "__main__":

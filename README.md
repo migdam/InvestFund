@@ -140,6 +140,45 @@ python analyze_polish_funds.py --clear-cache
 | `--plots` | Generate visualization plots | False |
 | `--score-config PATH` | Path to custom scoring weights JSON | None |
 | `--clear-cache` | Clear cache directory and exit | False |
+| `--benchmark TICKER` | Compute benchmark-relative metrics vs a market index | None |
+| `--correlation` | Build a correlation matrix and flag redundant holdings | False |
+
+## Benchmark Comparison
+
+Pass a market index with `--benchmark` to answer the key question: *is a fund
+actually beating the market, or just riding it?*
+
+```bash
+# Compare every fund against the WIG index
+python analyze_polish_funds.py --benchmark wig --format html
+```
+
+This adds the following columns to every report:
+
+| Metric | Meaning |
+|--------|---------|
+| `beta` | Sensitivity to benchmark moves (1.0 = moves with the market) |
+| `alpha` | Annualized excess return *after* adjusting for beta (CAPM). Positive = genuine outperformance |
+| `tracking_error` | Annualized volatility of the fund's active return vs the benchmark |
+| `information_ratio` | Active return per unit of tracking error (consistency of outperformance) |
+| `up_capture` | Share of the benchmark's up-moves captured (>1 = amplifies gains) |
+| `down_capture` | Share of the benchmark's down-moves captured (<1 = cushions losses) |
+
+Returns and the benchmark are aligned on common trading days, so funds that
+trade on different calendars are still compared fairly. A fund needs at least
+60 overlapping days for these metrics to be computed.
+
+## Correlation & Diversification
+
+Use `--correlation` to see which funds move together. Holding several highly
+correlated funds adds little diversification — this surfaces the redundant pairs.
+
+```bash
+python analyze_polish_funds.py --max-funds 30 --correlation
+```
+
+This writes a full correlation matrix to `<output>_correlation.csv` and prints
+any pairs with correlation ≥ 0.80 (limited diversification) to the console.
 
 ## Output Files
 

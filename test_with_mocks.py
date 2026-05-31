@@ -646,6 +646,123 @@ def run_tests():
     except Exception as e:
         results.add("Realistic Volatility Scenarios", False, str(e), time.time()-start)
 
+    # ========================================================================
+    # Test 26: Benchmark Metrics - structure and ranges
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        bench_df = MockData.generate_price_data(days=400, volatility=0.015, trend=0.0003)
+        fund_df = MockData.generate_price_data(days=400, volatility=0.02, trend=0.0004)
+
+        metrics = analyzer.calculate_benchmark_metrics(fund_df, bench_df)
+
+        # All six keys present
+        for key in ["beta", "alpha", "tracking_error", "information_ratio",
+                    "up_capture", "down_capture"]:
+            assert key in metrics
+        # Beta and tracking error should be computable and finite
+        assert metrics["beta"] is not None and np.isfinite(metrics["beta"])
+        assert metrics["tracking_error"] is not None and metrics["tracking_error"] >= 0
+        results.add("Benchmark Metrics Structure", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Benchmark Metrics Structure", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 27: Benchmark Metrics - beta of identical series is ~1
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        bench_df = MockData.generate_price_data(days=400, volatility=0.015)
+        # Fund identical to benchmark -> beta ~1, tracking error ~0
+        metrics = analyzer.calculate_benchmark_metrics(bench_df.copy(), bench_df)
+
+        assert metrics["beta"] is not None
+        assert abs(metrics["beta"] - 1.0) < 0.01, f"beta={metrics['beta']}"
+        assert metrics["tracking_error"] is not None
+        assert metrics["tracking_error"] < 1e-6, f"te={metrics['tracking_error']}"
+        results.add("Benchmark Beta Identity", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Benchmark Beta Identity", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 28: Benchmark Metrics - insufficient overlap returns Nones
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        bench_df = MockData.generate_price_data(days=400, volatility=0.015)
+        short_df = MockData.generate_price_data(days=30, volatility=0.02)
+
+        metrics = analyzer.calculate_benchmark_metrics(short_df, bench_df)
+        # < 60 overlapping days -> all None
+        assert all(metrics[k] is None for k in metrics)
+        results.add("Benchmark Insufficient Overlap", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Benchmark Insufficient Overlap", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 29: Correlation Matrix - identical funds correlate ~1
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        base = MockData.generate_price_data(days=300, volatility=0.02)
+
+        # Monkeypatch download_quotes to serve in-memory mock series
+        store = {
+            "A.N": base,
+            "B.N": base.copy(),  # identical -> correlation ~1
+            "C.N": MockData.generate_price_data(days=300, volatility=0.02),
+        }
+        analyzer.download_quotes = lambda symbol, max_retries=3: store.get(symbol)
+
+        corr, high_pairs = analyzer.compute_correlation_matrix(["A.N", "B.N", "C.N"])
+
+        assert corr is not None
+        # A and B are identical -> flagged as highly correlated
+        flagged = {(a, b) for a, b, _ in high_pairs}
+        assert ("A.N", "B.N") in flagged or ("B.N", "A.N") in flagged
+        results.add("Correlation Identical Funds", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Correlation Identical Funds", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 30: Correlation Matrix - too few funds returns empty
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        store = {"A.N": MockData.generate_price_data(days=300)}
+        analyzer.download_quotes = lambda symbol, max_retries=3: store.get(symbol)
+
+        corr, high_pairs = analyzer.compute_correlation_matrix(["A.N"])
+        assert corr is None and high_pairs == []
+        results.add("Correlation Too Few Funds", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Correlation Too Few Funds", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 31: analyze_fund populates benchmark fields when benchmark set
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        bench_df = MockData.generate_price_data(days=400, volatility=0.015)
+        fund_df = MockData.generate_price_data(days=400, volatility=0.02)
+
+        analyzer.benchmark_df = bench_df
+        analyzer.download_quotes = lambda symbol, max_retries=3: fund_df
+        m = analyzer.analyze_fund(FundInfo(symbol="X.N", name="Fund X"))
+
+        assert m is not None
+        assert m.beta is not None
+        assert m.tracking_error is not None
+        results.add("analyze_fund Benchmark Integration", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("analyze_fund Benchmark Integration", False, str(e), time.time()-start)
+
     # Print summary
     print()
     success = results.summary()
