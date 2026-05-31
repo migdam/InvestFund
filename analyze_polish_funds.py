@@ -1578,8 +1578,8 @@ def run_portfolio(args):
     print("=" * 80 + "\n", file=sys.stderr)
 
 
-def main():
-    """Main entry point for the script."""
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the command-line argument parser."""
     parser = argparse.ArgumentParser(
         description="Enhanced analysis of Polish investment funds from Stooq",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1689,7 +1689,12 @@ Examples:
         help="Assumed gross annual return for fee-drag projection (default: 0.06)"
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    """Main entry point for the script."""
+    args = build_parser().parse_args()
 
     # Handle cache clearing
     if args.clear_cache:
