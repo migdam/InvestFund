@@ -5,13 +5,10 @@ Tests all functionality without network dependencies
 """
 
 import sys
-import os
 import json
 import time
-import pickle
 from pathlib import Path
-from datetime import datetime, timedelta
-import shutil
+from datetime import datetime
 
 # Add current directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -857,7 +854,6 @@ def run_tests():
     # ========================================================================
     start = time.time()
     try:
-        import tempfile
         analyzer = FundAnalyzer(use_cache=False)
 
         # JSON (object with "holdings")
