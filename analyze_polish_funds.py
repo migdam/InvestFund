@@ -112,6 +112,34 @@ class FundMetrics:
     percentile_rank: Optional[float] = None
 
 
+@dataclass
+class Holding:
+    """A single position in a personal portfolio."""
+    symbol: str
+    shares: float
+    cost_basis: float  # price paid per share
+    ter: Optional[float] = None  # annual expense ratio, e.g. 0.018 = 1.8%
+    name: str = ""
+
+
+@dataclass
+class PortfolioPosition:
+    """Computed state of one holding, including current value and P&L."""
+    symbol: str
+    name: str
+    shares: float
+    cost_basis: float
+    current_price: Optional[float] = None
+    cost_value: float = 0.0
+    current_value: Optional[float] = None
+    unrealized_pnl: Optional[float] = None
+    unrealized_pnl_pct: Optional[float] = None
+    weight: Optional[float] = None  # share of total portfolio value
+    return_1y: Optional[float] = None
+    ter: Optional[float] = None
+    annual_fee_cost: Optional[float] = None  # ter * current_value
+
+
 class FundAnalyzer:
     """Main class for analyzing Polish investment funds."""
 
@@ -734,6 +762,197 @@ class FundAnalyzer:
         high_pairs.sort(key=lambda x: x[2], reverse=True)
         return corr, high_pairs
 
+    # ------------------------------------------------------------------
+    # Portfolio tracking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def load_portfolio(path: str) -> List[Holding]:
+        """
+        Load a list of holdings from a JSON or CSV file.
+
+        JSON format (either a top-level list or a {"holdings": [...]} object)::
+
+            [
+              {"symbol": "1006.N", "shares": 100, "cost_basis": 45.5,
+               "ter": 0.018, "name": "Example Fund"}
+            ]
+
+        CSV format: a header row with columns
+        ``symbol,shares,cost_basis[,ter,name]``.
+
+        Parameters
+        ----------
+        path : str
+            Path to the holdings file.
+
+        Returns
+        -------
+        List[Holding]
+        """
+        p = Path(path)
+        holdings: List[Holding] = []
+
+        if p.suffix.lower() == ".json":
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data["holdings"] if isinstance(data, dict) else data
+            for row in rows:
+                holdings.append(Holding(
+                    symbol=str(row["symbol"]),
+                    shares=float(row["shares"]),
+                    cost_basis=float(row["cost_basis"]),
+                    ter=float(row["ter"]) if row.get("ter") is not None else None,
+                    name=str(row.get("name", "")),
+                ))
+        else:
+            # Treat anything else as CSV
+            holdings_df = pd.read_csv(p)
+            for _, row in holdings_df.iterrows():
+                ter = row["ter"] if "ter" in holdings_df.columns and pd.notna(row["ter"]) else None
+                name = row["name"] if "name" in holdings_df.columns and pd.notna(row["name"]) else ""
+                holdings.append(Holding(
+                    symbol=str(row["symbol"]),
+                    shares=float(row["shares"]),
+                    cost_basis=float(row["cost_basis"]),
+                    ter=float(ter) if ter is not None else None,
+                    name=str(name),
+                ))
+
+        return holdings
+
+    def analyze_portfolio(
+        self, holdings: List[Holding]
+    ) -> Tuple[List[PortfolioPosition], Dict[str, Optional[float]]]:
+        """
+        Value a portfolio: current price, P&L, allocation and weighted return.
+
+        Each holding's latest price is taken from its most recent close. Funds
+        whose data cannot be fetched are still reported, but with ``None`` for
+        price-derived fields and excluded from totals.
+
+        Parameters
+        ----------
+        holdings : List[Holding]
+
+        Returns
+        -------
+        tuple
+            (list of PortfolioPosition, summary dict with total_cost,
+            total_value, total_pnl, total_pnl_pct, total_annual_fees,
+            weighted_return_1y, num_positions, num_priced).
+        """
+        positions: List[PortfolioPosition] = []
+
+        for h in holdings:
+            df = self.download_quotes(h.symbol)
+            cost_value = h.shares * h.cost_basis
+
+            pos = PortfolioPosition(
+                symbol=h.symbol,
+                name=h.name or h.symbol,
+                shares=h.shares,
+                cost_basis=h.cost_basis,
+                cost_value=cost_value,
+                ter=h.ter,
+            )
+
+            if df is not None and len(df) > 0:
+                current_price = float(df["Close"].iloc[-1])
+                current_value = h.shares * current_price
+                pos.current_price = current_price
+                pos.current_value = current_value
+                pos.unrealized_pnl = current_value - cost_value
+                pos.unrealized_pnl_pct = (
+                    (current_value - cost_value) / cost_value if cost_value else None
+                )
+                pos.return_1y = self.calculate_returns(df)["1y"]
+                if h.ter is not None:
+                    pos.annual_fee_cost = h.ter * current_value
+
+            positions.append(pos)
+
+        # Totals over positions that have a current value
+        priced = [p for p in positions if p.current_value is not None]
+        total_value = sum(p.current_value for p in priced)
+        total_cost = sum(p.cost_value for p in priced)
+        total_pnl = total_value - total_cost if priced else None
+        total_pnl_pct = (total_pnl / total_cost) if (priced and total_cost) else None
+        total_annual_fees = sum(
+            p.annual_fee_cost for p in priced if p.annual_fee_cost is not None
+        )
+
+        # Allocation weights and value-weighted 1y return
+        weighted_return_1y = None
+        if total_value:
+            weighted_sum = 0.0
+            weight_with_return = 0.0
+            for p in priced:
+                p.weight = p.current_value / total_value
+                if p.return_1y is not None:
+                    weighted_sum += p.weight * p.return_1y
+                    weight_with_return += p.weight
+            if weight_with_return > 0:
+                # Normalize by covered weight so missing returns don't dilute
+                weighted_return_1y = weighted_sum / weight_with_return
+
+        summary = {
+            "num_positions": len(positions),
+            "num_priced": len(priced),
+            "total_cost": total_cost if priced else None,
+            "total_value": total_value if priced else None,
+            "total_pnl": total_pnl,
+            "total_pnl_pct": total_pnl_pct,
+            "total_annual_fees": total_annual_fees if priced else None,
+            "weighted_return_1y": weighted_return_1y,
+        }
+
+        return positions, summary
+
+    @staticmethod
+    def project_fee_drag(
+        amount: float, ter: float, years: int, gross_annual_return: float
+    ) -> Dict[str, float]:
+        """
+        Project the long-term cost of an expense ratio (TER).
+
+        Compounds ``amount`` for ``years`` at ``gross_annual_return`` both with
+        and without the annual fee, where the fee is charged on the balance each
+        year (net factor = (1 + gross) * (1 - ter)).
+
+        Parameters
+        ----------
+        amount : float
+            Starting investment.
+        ter : float
+            Annual expense ratio (e.g. 0.018 for 1.8%).
+        years : int
+            Investment horizon in years.
+        gross_annual_return : float
+            Assumed gross annual return before fees (e.g. 0.06 for 6%).
+
+        Returns
+        -------
+        dict
+            gross_value, net_value, total_fees (terminal value lost to fees),
+            drag_pct (fees as a share of the no-fee terminal value).
+        """
+        gross_value = amount
+        net_value = amount
+        for _ in range(max(int(years), 0)):
+            gross_value *= (1 + gross_annual_return)
+            net_value *= (1 + gross_annual_return) * (1 - ter)
+
+        total_fees = gross_value - net_value
+        drag_pct = (total_fees / gross_value) if gross_value else 0.0
+
+        return {
+            "gross_value": gross_value,
+            "net_value": net_value,
+            "total_fees": total_fees,
+            "drag_pct": drag_pct,
+        }
+
     def analyze_fund(self, fund: FundInfo) -> Optional[FundMetrics]:
         """
         Perform complete analysis on a single fund.
@@ -1273,6 +1492,93 @@ class FundAnalyzer:
         plt.close()
 
 
+def run_portfolio(args):
+    """Run portfolio tracking and fee-drag analysis from a holdings file."""
+    analyzer = FundAnalyzer(use_cache=not args.no_cache)
+
+    try:
+        holdings = analyzer.load_portfolio(args.portfolio)
+    except Exception as exc:
+        print(f"Error: could not load portfolio '{args.portfolio}': {exc}",
+              file=sys.stderr)
+        return
+
+    if not holdings:
+        print("No holdings found in portfolio file.", file=sys.stderr)
+        return
+
+    print(f"Valuing {len(holdings)} holding(s)…", file=sys.stderr)
+    positions, summary = analyzer.analyze_portfolio(holdings)
+
+    # Build a DataFrame and export in the requested formats
+    df = pd.DataFrame([asdict(p) for p in positions])
+    # Order columns for readability
+    col_order = [
+        "symbol", "name", "shares", "cost_basis", "current_price",
+        "cost_value", "current_value", "unrealized_pnl", "unrealized_pnl_pct",
+        "weight", "return_1y", "ter", "annual_fee_cost",
+    ]
+    df = df[[c for c in col_order if c in df.columns]]
+    if summary.get("total_value"):
+        df = df.sort_values("current_value", ascending=False).reset_index(drop=True)
+
+    for fmt in args.format:
+        output_path = f"{args.output}.{fmt}"
+        if fmt == "csv":
+            analyzer.export_to_csv(df, output_path)
+        elif fmt == "excel":
+            analyzer.export_to_excel(df, output_path)
+        elif fmt == "json":
+            analyzer.export_to_json(df, output_path)
+        # HTML report is geared to fund screening; skip for portfolio mode
+
+    # Console summary
+    def fmt_money(x):
+        return f"{x:,.2f}" if x is not None else "N/A"
+
+    def fmt_pct(x):
+        return f"{x*100:.2f}%" if x is not None else "N/A"
+
+    print("\n" + "=" * 80, file=sys.stderr)
+    print("PORTFOLIO SUMMARY", file=sys.stderr)
+    print("=" * 80, file=sys.stderr)
+    print(f"Positions: {summary['num_positions']} "
+          f"(priced: {summary['num_priced']})", file=sys.stderr)
+    print(f"Total cost:    {fmt_money(summary['total_cost'])}", file=sys.stderr)
+    print(f"Total value:   {fmt_money(summary['total_value'])}", file=sys.stderr)
+    print(f"Unrealized P&L: {fmt_money(summary['total_pnl'])} "
+          f"({fmt_pct(summary['total_pnl_pct'])})", file=sys.stderr)
+    print(f"Value-weighted 1Y return: {fmt_pct(summary['weighted_return_1y'])}",
+          file=sys.stderr)
+    if summary.get("total_annual_fees"):
+        print(f"Estimated annual fees (TER): {fmt_money(summary['total_annual_fees'])}",
+              file=sys.stderr)
+
+    # Fee-drag projection on the current portfolio value
+    total_value = summary.get("total_value")
+    fee_positions = [p for p in positions if p.ter is not None and p.current_value]
+    if total_value and fee_positions:
+        # Value-weighted average TER across positions that have one
+        weighted_ter = sum(p.ter * p.current_value for p in fee_positions) / \
+            sum(p.current_value for p in fee_positions)
+        proj = analyzer.project_fee_drag(
+            amount=total_value,
+            ter=weighted_ter,
+            years=args.project_years,
+            gross_annual_return=args.assumed_return,
+        )
+        print("\n" + "-" * 80, file=sys.stderr)
+        print(f"FEE-DRAG PROJECTION ({args.project_years} yrs @ "
+              f"{args.assumed_return*100:.1f}% gross, avg TER "
+              f"{weighted_ter*100:.2f}%)", file=sys.stderr)
+        print("-" * 80, file=sys.stderr)
+        print(f"Value without fees: {fmt_money(proj['gross_value'])}", file=sys.stderr)
+        print(f"Value with fees:    {fmt_money(proj['net_value'])}", file=sys.stderr)
+        print(f"Lost to fees:       {fmt_money(proj['total_fees'])} "
+              f"({fmt_pct(proj['drag_pct'])} of the fee-free total)", file=sys.stderr)
+    print("=" * 80 + "\n", file=sys.stderr)
+
+
 def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
@@ -1362,6 +1668,28 @@ Examples:
              "redundant (highly correlated) holdings"
     )
 
+    parser.add_argument(
+        "--portfolio",
+        type=str,
+        default=None,
+        help="Path to a holdings file (JSON or CSV) to run portfolio "
+             "tracking: current value, P&L, allocation and fee analysis"
+    )
+
+    parser.add_argument(
+        "--project-years",
+        type=int,
+        default=10,
+        help="Horizon in years for portfolio fee-drag projection (default: 10)"
+    )
+
+    parser.add_argument(
+        "--assumed-return",
+        type=float,
+        default=0.06,
+        help="Assumed gross annual return for fee-drag projection (default: 0.06)"
+    )
+
     args = parser.parse_args()
 
     # Handle cache clearing
@@ -1372,6 +1700,11 @@ Examples:
             print(f"Cache directory {CACHE_DIR} cleared.", file=sys.stderr)
         else:
             print(f"Cache directory {CACHE_DIR} does not exist.", file=sys.stderr)
+        return
+
+    # Portfolio tracking mode: value holdings instead of screening all funds
+    if args.portfolio:
+        run_portfolio(args)
         return
 
     # Load custom scoring weights if provided

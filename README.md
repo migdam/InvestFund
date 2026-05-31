@@ -142,6 +142,9 @@ python analyze_polish_funds.py --clear-cache
 | `--clear-cache` | Clear cache directory and exit | False |
 | `--benchmark TICKER` | Compute benchmark-relative metrics vs a market index | None |
 | `--correlation` | Build a correlation matrix and flag redundant holdings | False |
+| `--portfolio PATH` | Track a holdings file (JSON/CSV): value, P&L, allocation, fees | None |
+| `--project-years N` | Horizon for portfolio fee-drag projection | 10 |
+| `--assumed-return R` | Assumed gross annual return for fee projection | 0.06 |
 
 ## Benchmark Comparison
 
@@ -179,6 +182,50 @@ python analyze_polish_funds.py --max-funds 30 --correlation
 
 This writes a full correlation matrix to `<output>_correlation.csv` and prints
 any pairs with correlation ≥ 0.80 (limited diversification) to the console.
+
+## Portfolio Tracking
+
+Track what you actually own. Provide a holdings file with `--portfolio` and the
+tool values each position, computes profit/loss, allocation, and a value-weighted
+return — then exports the result and prints a summary.
+
+```bash
+# Value your holdings (see sample_portfolio.json for the format)
+python analyze_polish_funds.py --portfolio sample_portfolio.json --format csv json
+```
+
+**Holdings file** — JSON (a list, or `{"holdings": [...]}`) or CSV with columns
+`symbol,shares,cost_basis[,ter,name]`:
+
+```json
+{
+  "holdings": [
+    {"symbol": "1006.N", "shares": 100, "cost_basis": 45.50, "ter": 0.018, "name": "Equity Fund"},
+    {"symbol": "1007.N", "shares": 250, "cost_basis": 12.30, "ter": 0.012, "name": "Bond Fund"}
+  ]
+}
+```
+
+- `cost_basis` — price paid per share
+- `ter` *(optional)* — annual expense ratio (e.g. `0.018` = 1.8%), used for fee analysis
+
+Each position reports current price, current value, unrealized P&L (absolute and
+%), portfolio weight, 1-year return, and estimated annual fee cost. Holdings whose
+data can't be fetched are still listed but excluded from totals.
+
+## Fee-Drag Projection
+
+Expense ratios are small per year but compound brutally over decades. When your
+holdings include a `ter`, portfolio mode projects how much those fees cost you:
+
+```bash
+python analyze_polish_funds.py --portfolio sample_portfolio.json \
+    --project-years 20 --assumed-return 0.06
+```
+
+It compounds your current portfolio value over the horizon at the assumed gross
+return, both with and without the (value-weighted average) TER, and reports the
+terminal value lost to fees. Defaults: `--project-years 10`, `--assumed-return 0.06`.
 
 ## Output Files
 
