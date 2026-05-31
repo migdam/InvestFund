@@ -27,3 +27,6 @@ streamlit>=1.30.0
 
 # Additional utilities
 python-dateutil>=2.8.0
+
+# Workflow specs in YAML (optional; workflows fall back to JSON)
+PyYAML>=6.0
