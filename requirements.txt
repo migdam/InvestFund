@@ -22,5 +22,8 @@ openpyxl>=3.1.0
 # Progress bars
 tqdm>=4.65.0
 
+# Interactive dashboard (optional; only needed for dashboard.py)
+streamlit>=1.30.0
+
 # Additional utilities
 python-dateutil>=2.8.0

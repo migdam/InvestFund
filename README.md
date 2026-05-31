@@ -62,6 +62,27 @@ cd InvestFund
 pip install -r requirements.txt
 ```
 
+## Interactive Dashboard
+
+For a point-and-click experience, run the Streamlit dashboard instead of the CLI:
+
+```bash
+pip install streamlit          # if not already installed
+streamlit run dashboard.py
+```
+
+It opens in your browser with two views:
+
+- **Fund Screener** — run the analysis, filter by recommendation and minimum
+  score, sort the table, view risk/return and score charts, and download
+  CSV/JSON. Supports an optional benchmark ticker.
+- **Portfolio Tracker** — upload a holdings file (JSON/CSV) to see value, P&L,
+  allocation, and an interactive fee-drag projection (adjust horizon and assumed
+  return with sliders).
+
+A **Demo mode** toggle (on by default) generates synthetic data, so you can try
+the whole interface without any network access. Turn it off to use live data.
+
 ## Usage
 
 ### Basic Usage
