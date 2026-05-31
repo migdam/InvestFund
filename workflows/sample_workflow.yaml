@@ -1,0 +1,32 @@
+# Sample dynamic workflow for the Polish Funds Analyzer.
+#
+# Run it with:
+#   python -c "from workflows.engine import load_and_run; load_and_run('workflows/sample_workflow.yaml', demo=True)"
+#
+# Steps run top to bottom, sharing a context. Remove `demo=True` (and use real
+# tickers) to run against live Stooq data.
+
+name: Screen, alert and export top funds
+
+steps:
+  # 1. Screen funds (optionally against a benchmark for beta/alpha/etc.)
+  - action: screen
+    params:
+      max_funds: 100
+      benchmark: wig
+
+  # 2. Keep only strong Buy candidates
+  - action: filter
+    params:
+      recommendation: [Buy]
+      min_score: 70
+
+  # 3. Flag any rule violations among the survivors
+  - action: alert
+    params: {}
+
+  # 4. Write the shortlist to disk
+  - action: export
+    params:
+      format: [csv, html]
+      output: workflow_results
