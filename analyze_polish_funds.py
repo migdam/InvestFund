@@ -36,7 +36,6 @@ Install with: pip install pandas requests beautifulsoup4 numpy scipy matplotlib 
 import argparse
 import datetime
 import json
-import os
 import pickle
 import sys
 import warnings
