@@ -1877,6 +1877,11 @@ def main():
         try:
             with open(args.score_config, 'r') as f:
                 score_weights = json.load(f)
+            # The shipped scoring_configs/*.json nest the weights under a
+            # "weights" key (alongside description/comment); a flat mapping (as
+            # in the README) is used directly.
+            if isinstance(score_weights, dict) and "weights" in score_weights:
+                score_weights = score_weights["weights"]
             print(f"Loaded custom scoring weights from {args.score_config}", file=sys.stderr)
         except Exception as e:
             print(f"Warning: Could not load score config: {e}", file=sys.stderr)
@@ -1949,9 +1954,11 @@ def main():
     print(top10.to_string(index=False), file=sys.stderr)
     print("="*80 + "\n", file=sys.stderr)
 
-    # Export to requested formats
+    # Export to requested formats. The file extension differs from the format
+    # name for Excel (.xlsx, not .excel — pandas/openpyxl rejects ".excel").
+    format_extensions = {"csv": "csv", "excel": "xlsx", "json": "json", "html": "html"}
     for fmt in args.format:
-        output_path = f"{args.output}.{fmt}"
+        output_path = f"{args.output}.{format_extensions.get(fmt, fmt)}"
         if fmt == 'csv':
             analyzer.export_to_csv(df, output_path)
         elif fmt == 'excel':

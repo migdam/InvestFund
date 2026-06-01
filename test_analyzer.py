@@ -15,6 +15,22 @@ import shutil
 TEST_DIR = Path("test_output")
 CACHE_DIR = Path(".fund_cache")
 
+# Invoke the SAME interpreter that's running this suite (e.g. the project venv),
+# not whatever bare "python" happens to be on PATH — otherwise subprocesses can
+# run under a different environment that's missing optional deps such as
+# matplotlib/seaborn, which silently disables --plots and breaks the plot tests.
+PY = sys.executable
+
+# Every analysis command runs through the analizy.pl provider. Stooq's free
+# endpoints were retired (the fund-listing page is now a JavaScript app and the
+# CSV quote endpoint requires a captcha-issued API key), so the default Stooq
+# path can no longer run unattended. analizy.pl serves NAV history without a key.
+# test_symbols_analizy.txt holds a small basket of verified fund symbols so the
+# multi-fund and parallel/sequential tests are meaningful. Arg-parsing tests
+# (--help, --invalid-flag, --clear-cache) deliberately omit these args.
+ANALYZE = (f'"{PY}" analyze_polish_funds.py '
+           "--provider analizy --symbols-file test_symbols_analizy.txt")
+
 
 class TestSuite:
     """Comprehensive test suite for the analyzer"""
@@ -136,7 +152,7 @@ def main():
     )
     def test_basic_execution():
         success, stdout, stderr = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 --output {TEST_DIR}/basic"
+            f"{ANALYZE} --max-funds 5 --output {TEST_DIR}/basic"
         )
         return success and suite.file_exists(f"{TEST_DIR}/basic.csv")
 
@@ -151,7 +167,7 @@ def main():
     )
     def test_csv_export():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 --format csv --output {TEST_DIR}/csv_test"
+            f"{ANALYZE} --max-funds 5 --format csv --output {TEST_DIR}/csv_test"
         )
         if not success:
             return False
@@ -182,7 +198,7 @@ def main():
     )
     def test_excel_export():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 --format excel --output {TEST_DIR}/excel_test"
+            f"{ANALYZE} --max-funds 5 --format excel --output {TEST_DIR}/excel_test"
         )
         if not success:
             return False
@@ -210,7 +226,7 @@ def main():
     )
     def test_json_export():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 --format json --output {TEST_DIR}/json_test"
+            f"{ANALYZE} --max-funds 5 --format json --output {TEST_DIR}/json_test"
         )
         if not success:
             return False
@@ -238,7 +254,7 @@ def main():
     )
     def test_html_export():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 --format html --output {TEST_DIR}/html_test"
+            f"{ANALYZE} --max-funds 5 --format html --output {TEST_DIR}/html_test"
         )
         if not success:
             return False
@@ -268,7 +284,7 @@ def main():
     )
     def test_multiple_formats():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 --format csv excel json html --output {TEST_DIR}/multi"
+            f"{ANALYZE} --max-funds 5 --format csv excel json html --output {TEST_DIR}/multi"
         )
         if not success:
             return False
@@ -296,7 +312,7 @@ def main():
             shutil.rmtree(CACHE_DIR)
 
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 3 --output {TEST_DIR}/cache1"
+            f"{ANALYZE} --max-funds 3 --output {TEST_DIR}/cache1"
         )
 
         # Check cache directory was created
@@ -311,12 +327,12 @@ def main():
     def test_caching_second_run():
         # First run
         start1 = time.time()
-        suite.run_command(f"python analyze_polish_funds.py --max-funds 3 --output {TEST_DIR}/cache_timing1")
+        suite.run_command(f"{ANALYZE} --max-funds 3 --output {TEST_DIR}/cache_timing1")
         time1 = time.time() - start1
 
         # Second run (should use cache)
         start2 = time.time()
-        success, _, _ = suite.run_command(f"python analyze_polish_funds.py --max-funds 3 --output {TEST_DIR}/cache_timing2")
+        success, _, _ = suite.run_command(f"{ANALYZE} --max-funds 3 --output {TEST_DIR}/cache_timing2")
         time2 = time.time() - start2
 
         suite.log(f"  First run: {time1:.2f}s, Second run: {time2:.2f}s")
@@ -331,7 +347,7 @@ def main():
     )
     def test_no_cache():
         success, _, stderr = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 3 --no-cache --output {TEST_DIR}/nocache"
+            f"{ANALYZE} --max-funds 3 --no-cache --output {TEST_DIR}/nocache"
         )
         return success
 
@@ -343,10 +359,10 @@ def main():
     )
     def test_clear_cache():
         # Ensure cache exists
-        suite.run_command(f"python analyze_polish_funds.py --max-funds 2 --output {TEST_DIR}/temp")
+        suite.run_command(f"{ANALYZE} --max-funds 2 --output {TEST_DIR}/temp")
 
         # Clear it
-        success, _, _ = suite.run_command("python analyze_polish_funds.py --clear-cache")
+        success, _, _ = suite.run_command(f'"{PY}" analyze_polish_funds.py --clear-cache')
 
         # Check cache is gone or empty
         return success and (not CACHE_DIR.exists() or len(list(CACHE_DIR.glob("*.pkl"))) == 0)
@@ -362,7 +378,7 @@ def main():
     )
     def test_balanced_config():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 "
+            f"{ANALYZE} --max-funds 5 "
             f"--score-config scoring_configs/balanced.json --output {TEST_DIR}/balanced"
         )
         return success and suite.file_exists(f"{TEST_DIR}/balanced.csv")
@@ -375,7 +391,7 @@ def main():
     )
     def test_conservative_config():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 "
+            f"{ANALYZE} --max-funds 5 "
             f"--score-config scoring_configs/conservative.json --output {TEST_DIR}/conservative"
         )
         return success and suite.file_exists(f"{TEST_DIR}/conservative.csv")
@@ -388,7 +404,7 @@ def main():
     )
     def test_aggressive_config():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 "
+            f"{ANALYZE} --max-funds 5 "
             f"--score-config scoring_configs/aggressive.json --output {TEST_DIR}/aggressive"
         )
         return success and suite.file_exists(f"{TEST_DIR}/aggressive.csv")
@@ -404,7 +420,7 @@ def main():
     )
     def test_workers_1():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 5 --workers 1 --output {TEST_DIR}/workers1"
+            f"{ANALYZE} --max-funds 5 --workers 1 --output {TEST_DIR}/workers1"
         )
         return success
 
@@ -416,7 +432,7 @@ def main():
     )
     def test_workers_5():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 10 --workers 5 --output {TEST_DIR}/workers5"
+            f"{ANALYZE} --max-funds 10 --workers 5 --output {TEST_DIR}/workers5"
         )
         return success
 
@@ -428,7 +444,7 @@ def main():
     )
     def test_workers_20():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 10 --workers 20 --output {TEST_DIR}/workers20"
+            f"{ANALYZE} --max-funds 10 --workers 20 --output {TEST_DIR}/workers20"
         )
         return success
 
@@ -455,7 +471,7 @@ def main():
     )
     def test_one_fund():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 1 --output {TEST_DIR}/one_fund",
+            f"{ANALYZE} --max-funds 1 --output {TEST_DIR}/one_fund",
             timeout=60
         )
         return success
@@ -468,7 +484,7 @@ def main():
     )
     def test_large_dataset():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 50 --output {TEST_DIR}/large_dataset",
+            f"{ANALYZE} --max-funds 50 --output {TEST_DIR}/large_dataset",
             timeout=300
         )
         return success
@@ -484,7 +500,7 @@ def main():
     )
     def test_plots():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 10 --plots --output {TEST_DIR}/plots_test",
+            f"{ANALYZE} --max-funds 10 --plots --output {TEST_DIR}/plots_test",
             timeout=120
         )
 
@@ -514,7 +530,7 @@ def main():
         "Verify all scores are between 0 and 100"
     )
     def test_score_range():
-        suite.run_command(f"python analyze_polish_funds.py --max-funds 10 --output {TEST_DIR}/validation")
+        suite.run_command(f"{ANALYZE} --max-funds 10 --output {TEST_DIR}/validation")
 
         import pandas as pd
         try:
@@ -577,7 +593,7 @@ def main():
 
         # Should still run but with warning
         success, _, stderr = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 3 --score-config {invalid_config} "
+            f"{ANALYZE} --max-funds 3 --score-config {invalid_config} "
             f"--output {TEST_DIR}/invalid_config"
         )
         # Should fail or show warning but continue with defaults
@@ -592,7 +608,7 @@ def main():
     def test_invalid_output():
         # Try to write to non-existent deep directory
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 2 "
+            f"{ANALYZE} --max-funds 2 "
             f"--output /nonexistent/deep/path/output",
             timeout=60
         )
@@ -609,7 +625,7 @@ def main():
         "Test --help flag"
     )
     def test_help():
-        success, stdout, _ = suite.run_command("python analyze_polish_funds.py --help")
+        success, stdout, _ = suite.run_command(f'"{PY}" analyze_polish_funds.py --help')
         return success and "usage:" in stdout.lower()
 
     test_help()
@@ -619,7 +635,7 @@ def main():
         "Test with invalid command-line arguments"
     )
     def test_invalid_args():
-        success, _, _ = suite.run_command("python analyze_polish_funds.py --invalid-flag")
+        success, _, _ = suite.run_command(f'"{PY}" analyze_polish_funds.py --invalid-flag')
         return not success  # Should fail with invalid args
 
     test_invalid_args()
@@ -635,7 +651,7 @@ def main():
         # Sequential
         start = time.time()
         suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 20 --workers 1 "
+            f"{ANALYZE} --max-funds 20 --workers 1 "
             f"--no-cache --output {TEST_DIR}/perf_seq",
             timeout=300
         )
@@ -648,7 +664,7 @@ def main():
         # Parallel
         start = time.time()
         suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 20 --workers 10 "
+            f"{ANALYZE} --max-funds 20 --workers 10 "
             f"--no-cache --output {TEST_DIR}/perf_par",
             timeout=300
         )
@@ -671,7 +687,7 @@ def main():
     )
     def test_full_integration():
         success, _, _ = suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 20 "
+            f"{ANALYZE} --max-funds 20 "
             f"--format csv excel json html --plots "
             f"--score-config scoring_configs/balanced.json "
             f"--workers 10 --output {TEST_DIR}/integration",
@@ -702,7 +718,7 @@ def main():
     )
     def test_data_consistency():
         suite.run_command(
-            f"python analyze_polish_funds.py --max-funds 10 "
+            f"{ANALYZE} --max-funds 10 "
             f"--format csv json excel --output {TEST_DIR}/consistency"
         )
 
