@@ -449,6 +449,34 @@ series (total return) when available. The returned DataFrame matches the schema
 > Review their terms of use before heavy or commercial scraping. This is an
 > additional option, not a guaranteed-stable API.
 
+**Switch providers from the CLI** with `--provider`:
+
+```bash
+# Use the analizy.pl TFI source instead of Stooq
+python analyze_polish_funds.py --provider analizy --portfolio my_holdings.json
+```
+
+Cache entries are namespaced per provider, so Stooq and analizy.pl results
+never collide.
+
+**Symbol mapping.** The two sources use different tickers for the same fund
+(Stooq `*.N` vs analizy.pl codes like `ING35`). `providers.SymbolMapper` lets
+you keep one watch/holdings file and resolve the right symbol per provider:
+
+```python
+from providers import SymbolMapper
+mapper = SymbolMapper.from_file("symbol_map.json")
+mapper.resolve("ING35", "stooq")     # reverse-maps to the Stooq ticker
+```
+
+`symbol_map.json` maps a canonical name to per-provider symbols:
+
+```json
+{ "GS Globalny": {"stooq": "1234.N", "analizy": "ING35"} }
+```
+
+Unmapped symbols pass through unchanged, so mapping is optional.
+
 ### Calculations
 - **Trading Days**: 252 per year assumed
 - **Risk-Free Rate**: 5% annual (configurable in code)

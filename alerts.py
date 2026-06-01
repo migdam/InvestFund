@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import operator
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, fields as dataclass_fields
 from typing import Any, Callable, Dict, List, Optional
 
 

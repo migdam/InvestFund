@@ -153,6 +153,37 @@ def run() -> int:
           AnalizyProvider().name == "analizy"
           and StooqProvider().name == "stooq")
 
+    # 9. SymbolMapper: canonical key, reverse lookup, passthrough
+    from providers import SymbolMapper
+    mapper = SymbolMapper({
+        "GS Globalny": {"stooq": "1234.N", "analizy": "ING35"},
+        "Bond Fund": {"analizy": "ABC12"},
+    })
+    check("map by canonical key -> analizy",
+          mapper.resolve("GS Globalny", "analizy") == "ING35")
+    check("map by canonical key -> stooq",
+          mapper.resolve("GS Globalny", "stooq") == "1234.N")
+    check("reverse lookup: stooq symbol -> analizy",
+          mapper.resolve("1234.N", "analizy") == "ING35")
+    check("reverse lookup: analizy symbol -> stooq",
+          mapper.resolve("ING35", "stooq") == "1234.N")
+    check("unmapped symbol passes through unchanged",
+          mapper.resolve("UNKNOWN.N", "analizy") == "UNKNOWN.N")
+    check("missing provider in entry -> passthrough",
+          mapper.resolve("Bond Fund", "stooq") == "Bond Fund")
+    check("empty mapper passes everything through",
+          SymbolMapper().resolve("ING35", "stooq") == "ING35")
+
+    # 10. SymbolMapper.from_file round-trips
+    import json as _json
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        _json.dump({"X": {"stooq": "9.N", "analizy": "QQ1"}}, fh)
+        map_path = fh.name
+    loaded = SymbolMapper.from_file(map_path)
+    check("from_file resolves correctly",
+          loaded.resolve("X", "analizy") == "QQ1")
+
     print()
     if failures:
         print(f"PROVIDER TESTS: {failures} failed")

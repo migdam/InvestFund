@@ -142,7 +142,8 @@ class PortfolioPosition:
 class FundAnalyzer:
     """Main class for analyzing Polish investment funds."""
 
-    def __init__(self, use_cache: bool = True, cache_dir: Path = CACHE_DIR):
+    def __init__(self, use_cache: bool = True, cache_dir: Path = CACHE_DIR,
+                 quote_source=None):
         """
         Initialize the analyzer.
 
@@ -152,9 +153,14 @@ class FundAnalyzer:
             Whether to use caching for downloaded data
         cache_dir : Path
             Directory for cache storage
+        quote_source : callable, optional
+            A function ``fn(symbol) -> Optional[pd.DataFrame]`` used to fetch
+            quotes instead of the built-in Stooq endpoint (e.g. a provider from
+            ``providers.py``). Results still flow through the shared cache.
         """
         self.use_cache = use_cache
         self.cache_dir = cache_dir
+        self.quote_source = quote_source
         if use_cache:
             self.cache_dir.mkdir(exist_ok=True)
 
@@ -288,7 +294,10 @@ class FundAnalyzer:
         pd.DataFrame or None
             DataFrame with Date, Open, High, Low, Close, Volume columns
         """
-        cache_file = self.cache_dir / f"{symbol.replace('.', '_')}.pkl"
+        # Namespace cache by source so different providers don't collide
+        source_tag = getattr(self.quote_source, "name", "stooq") if self.quote_source else "stooq"
+        safe_symbol = symbol.replace('.', '_')
+        cache_file = self.cache_dir / f"{source_tag}__{safe_symbol}.pkl"
 
         # Check cache (with race condition protection)
         if self.use_cache and cache_file.exists():
@@ -302,6 +311,25 @@ class FundAnalyzer:
             except (FileNotFoundError, EOFError, pickle.UnpicklingError):
                 # Cache file was deleted, corrupted, or incomplete - ignore and re-download
                 pass
+
+        # If an external provider is configured, use it (then cache the result)
+        if self.quote_source is not None:
+            try:
+                df = self.quote_source(symbol)
+            except Exception as exc:
+                print(f"Warning: provider failed for {symbol}: {exc}", file=sys.stderr)
+                return None
+            if df is None or len(df) == 0:
+                return None
+            if self.use_cache:
+                try:
+                    temp_file = cache_file.with_suffix('.tmp')
+                    with open(temp_file, "wb") as f:
+                        pickle.dump(df, f)
+                    temp_file.replace(cache_file)
+                except Exception:
+                    pass
+            return df
 
         # Download with retries
         url = f"https://stooq.pl/q/d/l/?s={symbol.lower()}&i=d"
@@ -1194,12 +1222,6 @@ class FundAnalyzer:
         data = [asdict(m) for m in results]
         df = pd.DataFrame(data)
 
-        # Format percentage columns
-        pct_cols = [
-            "return_1m", "return_3m", "return_6m", "return_1y", "return_ytd",
-            "volatility", "max_drawdown", "var_95", "cvar_95"
-        ]
-
         # Sort by score descending
         df = df.sort_values("score", ascending=False).reset_index(drop=True)
 
@@ -1493,7 +1515,10 @@ class FundAnalyzer:
 
 def run_portfolio(args):
     """Run portfolio tracking and fee-drag analysis from a holdings file."""
-    analyzer = FundAnalyzer(use_cache=not args.no_cache)
+    analyzer = FundAnalyzer(
+        use_cache=not args.no_cache,
+        quote_source=build_quote_source(getattr(args, "provider", "stooq")),
+    )
 
     try:
         holdings = analyzer.load_portfolio(args.portfolio)
@@ -1689,7 +1714,32 @@ Examples:
         help="Assumed gross annual return for fee-drag projection (default: 0.06)"
     )
 
+    parser.add_argument(
+        "--provider",
+        choices=["stooq", "analizy"],
+        default="stooq",
+        help="Data source for fund quotes: 'stooq' (default) or 'analizy' "
+             "(analizy.pl TFI NAV API; uses analizy.pl symbols like ING35)"
+    )
+
     return parser
+
+
+def build_quote_source(provider: str):
+    """
+    Return a quote-source callable for the chosen provider, or None for Stooq
+    (which uses FundAnalyzer's built-in path).
+
+    Parameters
+    ----------
+    provider : str
+        "stooq" or "analizy".
+    """
+    if provider == "analizy":
+        from providers import AnalizyProvider
+        prov = AnalizyProvider()
+        return prov.download_quotes
+    return None
 
 
 def main():
@@ -1721,8 +1771,13 @@ def main():
         except Exception as e:
             print(f"Warning: Could not load score config: {e}", file=sys.stderr)
 
-    # Initialize analyzer
-    analyzer = FundAnalyzer(use_cache=not args.no_cache)
+    # Initialize analyzer (optionally with an alternative data provider)
+    analyzer = FundAnalyzer(
+        use_cache=not args.no_cache,
+        quote_source=build_quote_source(args.provider),
+    )
+    if args.provider != "stooq":
+        print(f"Using data provider: {args.provider}", file=sys.stderr)
 
     # Load benchmark for relative metrics, if requested
     if args.benchmark:

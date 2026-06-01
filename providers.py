@@ -40,8 +40,10 @@ This tool is for informational/educational use only and is not investment advice
 
 from __future__ import annotations
 
+import json
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import Dict, Optional
 
 import pandas as pd
 import requests
@@ -193,3 +195,55 @@ class AnalizyProvider(DataProvider):
         if payload is None:
             return None
         return self.parse_payload(payload, prefer_dividend=self.prefer_dividend)
+
+
+class SymbolMapper:
+    """
+    Translate a fund's symbol between providers.
+
+    Stooq and analizy.pl use different tickers for the same fund (e.g. a Stooq
+    ``*.N`` code vs an analizy.pl code like ``ING35``). A mapping lets you keep
+    one holdings/watch file and resolve the right symbol per provider.
+
+    The mapping JSON maps a canonical key to per-provider symbols::
+
+        {
+          "GS Globalny Spolek Dyw": {"stooq": "1234.N", "analizy": "ING35"},
+          "...": {"analizy": "ABC12"}
+        }
+
+    Resolution is also reversible: given any known provider symbol you can look
+    up the symbol for another provider.
+    """
+
+    def __init__(self, mapping: Optional[Dict[str, Dict[str, str]]] = None):
+        self.mapping: Dict[str, Dict[str, str]] = mapping or {}
+
+    @classmethod
+    def from_file(cls, path: str) -> "SymbolMapper":
+        """Load a mapping from a JSON file (see class docstring for format)."""
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Symbol map must be a JSON object")
+        return cls(data)
+
+    def resolve(self, symbol: str, provider: str) -> str:
+        """
+        Return the symbol to use for ``provider``.
+
+        Accepts either a canonical key or any provider's symbol for the same
+        fund. Falls back to the input symbol unchanged if no mapping is found
+        (so unmapped symbols still work).
+        """
+        # Direct canonical-key hit
+        entry = self.mapping.get(symbol)
+        if entry and provider in entry:
+            return entry[provider]
+
+        # Reverse lookup: find the entry containing this symbol under any provider
+        for providers_map in self.mapping.values():
+            if symbol in providers_map.values() and provider in providers_map:
+                return providers_map[provider]
+
+        # Unmapped: use as-is
+        return symbol
