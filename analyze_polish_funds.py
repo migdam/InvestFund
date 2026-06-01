@@ -1765,8 +1765,22 @@ def build_quote_source(provider: str):
     if provider == "analizy":
         from providers import AnalizyProvider
         prov = AnalizyProvider()
-        return prov.download_quotes
+        # Wrap so the cache can namespace by source: a bound method has no
+        # usable ``.name`` of its own, so download_quotes' cache tag would
+        # otherwise fall back to "stooq".
+        return _NamedSource(prov.download_quotes, prov.name)
     return None
+
+
+class _NamedSource:
+    """Wraps a quote-source callable with a stable ``name`` for cache tagging."""
+
+    def __init__(self, fn, name: str):
+        self._fn = fn
+        self.name = name
+
+    def __call__(self, symbol):
+        return self._fn(symbol)
 
 
 def main():
