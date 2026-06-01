@@ -422,10 +422,32 @@ python analyze_polish_funds.py --no-cache --max-funds 50
 
 ## Technical Details
 
-### Data Source
-- **Provider**: Stooq.pl
+### Data Sources
+- **Default provider**: Stooq.pl
 - **Update Frequency**: Daily (depends on fund)
 - **Historical Data**: Varies by fund (some have years, others months)
+
+#### Alternative provider: analizy.pl (Polish TFI funds)
+
+`providers.py` adds a pluggable data-source layer so the analyzer isn't tied to
+Stooq. It includes `AnalizyProvider`, which fetches Polish open-end fund (TFI)
+NAV history from the analizy.pl quotation API:
+
+```python
+from providers import AnalizyProvider
+
+provider = AnalizyProvider()                 # or prefer_dividend=True
+df = provider.download_quotes("ING35")       # -> Date/Open/High/Low/Close/Volume
+```
+
+Funds publish a single daily NAV, so OHLC columns all carry that NAV and Volume
+is 0. For distribution funds, `prefer_dividend=True` uses the dividend-adjusted
+series (total return) when available. The returned DataFrame matches the schema
+`FundAnalyzer` already consumes, so it's a drop-in source for metrics.
+
+> ⚠️ The analizy.pl endpoint is **undocumented** and may change without notice.
+> Review their terms of use before heavy or commercial scraping. This is an
+> additional option, not a guaranteed-stable API.
 
 ### Calculations
 - **Trading Days**: 252 per year assumed
