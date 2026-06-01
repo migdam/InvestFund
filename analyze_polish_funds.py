@@ -36,6 +36,7 @@ Install with: pip install pandas requests beautifulsoup4 numpy scipy matplotlib 
 import argparse
 import datetime
 import json
+import os
 import pickle
 import sys
 import warnings
@@ -67,6 +68,12 @@ TRADING_DAYS_PER_YEAR = 252
 RISK_FREE_RATE = 0.05  # 5% annual risk-free rate (adjust as needed)
 CACHE_DIR = Path(".fund_cache")
 CACHE_EXPIRY_DAYS = 1  # Cache expires after 1 day
+
+# Stooq, as of 2024+, gates its CSV download endpoint behind a (captcha-issued)
+# API key. When no key (or an invalid one) is supplied, the endpoint returns
+# HTTP 200 with this Polish sentinel ("Get an API key:") instead of CSV data.
+STOOQ_APIKEY_ENV = "STOOQ_APIKEY"
+STOOQ_APIKEY_SENTINEL = "uzyskaj apikey"
 
 
 @dataclass
@@ -143,7 +150,7 @@ class FundAnalyzer:
     """Main class for analyzing Polish investment funds."""
 
     def __init__(self, use_cache: bool = True, cache_dir: Path = CACHE_DIR,
-                 quote_source=None):
+                 quote_source=None, stooq_apikey: Optional[str] = None):
         """
         Initialize the analyzer.
 
@@ -157,10 +164,15 @@ class FundAnalyzer:
             A function ``fn(symbol) -> Optional[pd.DataFrame]`` used to fetch
             quotes instead of the built-in Stooq endpoint (e.g. a provider from
             ``providers.py``). Results still flow through the shared cache.
+        stooq_apikey : str, optional
+            API key for Stooq's CSV download endpoint, which now requires one.
+            Falls back to the ``STOOQ_APIKEY`` environment variable. Obtain a
+            key (one-time captcha) at https://stooq.pl/q/d/?s=wig&get_apikey
         """
         self.use_cache = use_cache
         self.cache_dir = cache_dir
         self.quote_source = quote_source
+        self.stooq_apikey = stooq_apikey or os.environ.get(STOOQ_APIKEY_ENV)
         if use_cache:
             self.cache_dir.mkdir(exist_ok=True)
 
@@ -253,7 +265,22 @@ class FundAnalyzer:
             table = table.find_next("table")
 
         if not table:
-            raise RuntimeError("Could not locate fund listing table on the page")
+            # Stooq migrated this page to a JavaScript app: the server now
+            # returns an HTML shell with no <table> to scrape. Give the user a
+            # concrete path forward instead of a cryptic parse error.
+            has_table = "<table" in resp.text.lower()
+            if not has_table:
+                raise RuntimeError(
+                    "Stooq's fund listing at {url} no longer returns a server-"
+                    "rendered table (it is now a JavaScript app), so automated "
+                    "listing is unavailable. Supply symbols explicitly with "
+                    "--symbols-file, or use --provider analizy. "
+                    "Run `python doctor.py` to check data-source health.".format(url=url)
+                )
+            raise RuntimeError(
+                "Could not locate the fund listing table on {url} (its layout "
+                "may have changed). Try --symbols-file or --provider analizy.".format(url=url)
+            )
 
         funds = []
         for tr in table.find_all("tr"):
@@ -331,8 +358,10 @@ class FundAnalyzer:
                     pass
             return df
 
-        # Download with retries
+        # Download with retries. Stooq now requires an API key on this endpoint.
         url = f"https://stooq.pl/q/d/l/?s={symbol.lower()}&i=d"
+        if self.stooq_apikey:
+            url += f"&apikey={self.stooq_apikey}"
 
         for attempt in range(max_retries):
             try:
@@ -344,6 +373,25 @@ class FundAnalyzer:
                 if not lines:
                     # Empty response, skip to next retry
                     continue
+
+                # Stooq gates this endpoint behind an API key: instead of CSV it
+                # returns a "Uzyskaj apikey:" notice (HTTP 200). Detect that and
+                # fail loudly with guidance rather than silently yielding no data.
+                if STOOQ_APIKEY_SENTINEL in csv_data[:200].lower():
+                    hint = (
+                        "set one via --stooq-apikey or the STOOQ_APIKEY env var"
+                        if not self.stooq_apikey
+                        else "the supplied STOOQ_APIKEY may be invalid/expired"
+                    )
+                    print(
+                        f"Error: Stooq requires an API key to download '{symbol}' "
+                        f"({hint}). Get a key (one-time captcha) at "
+                        "https://stooq.pl/q/d/?s=wig&get_apikey , or use "
+                        "--provider analizy instead.",
+                        file=sys.stderr,
+                    )
+                    return None
+
                 first_line = lines[0].lower()
                 has_header = first_line.startswith("date")
 
@@ -1730,6 +1778,22 @@ Examples:
              "list). Required for --provider analizy (no bulk list endpoint)."
     )
 
+    parser.add_argument(
+        "--stooq-apikey",
+        type=str,
+        default=None,
+        help="API key for Stooq's CSV endpoint (now required). Falls back to "
+             "the STOOQ_APIKEY env var. Get one at "
+             "https://stooq.pl/q/d/?s=wig&get_apikey"
+    )
+
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run environment & data-source health checks (deps, network, each "
+             "provider) and exit with a clear pass/fail. Same as `python doctor.py`."
+    )
+
     return parser
 
 
@@ -1787,6 +1851,11 @@ def main():
     """Main entry point for the script."""
     args = build_parser().parse_args()
 
+    # Environment / data-source health check
+    if args.self_test:
+        from doctor import run_doctor
+        sys.exit(run_doctor(stooq_apikey=args.stooq_apikey))
+
     # Handle cache clearing
     if args.clear_cache:
         import shutil
@@ -1816,6 +1885,7 @@ def main():
     analyzer = FundAnalyzer(
         use_cache=not args.no_cache,
         quote_source=build_quote_source(args.provider),
+        stooq_apikey=args.stooq_apikey,
     )
     if args.provider != "stooq":
         print(f"Using data provider: {args.provider}", file=sys.stderr)
@@ -1844,7 +1914,11 @@ def main():
         return
     else:
         print("Downloading list of funds…", file=sys.stderr)
-        funds = analyzer.get_fund_list()
+        try:
+            funds = analyzer.get_fund_list()
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
     print(f"Found {len(funds)} funds.", file=sys.stderr)
 
     # Limit funds if requested
