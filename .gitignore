@@ -52,6 +52,8 @@ results_*.html
 *.xlsx
 *.json
 !scoring_configs/*.json
+!sample_portfolio.json
+!symbol_map.json
 !requirements.txt
 
 # Plots directory

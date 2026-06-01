@@ -1,0 +1,7 @@
+{
+  "holdings": [
+    {"symbol": "1006.N", "shares": 100, "cost_basis": 45.50, "ter": 0.018, "name": "Example Equity Fund"},
+    {"symbol": "1007.N", "shares": 250, "cost_basis": 12.30, "ter": 0.012, "name": "Example Bond Fund"},
+    {"symbol": "1008.N", "shares": 40, "cost_basis": 88.00, "ter": 0.022, "name": "Example Mixed Fund"}
+  ]
+}

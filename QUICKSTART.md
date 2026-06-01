@@ -2,6 +2,12 @@
 
 Get started analyzing Polish investment funds in 5 minutes!
 
+> ⚠️ **Data-source status — read this first.** Stooq's free feed no longer works
+> out of the box: the fund-listing page is now a JavaScript app (nothing to
+> scrape) and the CSV quote endpoint requires a captcha-issued API key. **The
+> recommended path is the `analizy.pl` provider** (shown below) — it needs no
+> key. Run `python doctor.py` at any time to see exactly what's working.
+
 ## Step 1: Install Dependencies
 
 ```bash
@@ -10,95 +16,123 @@ pip install -r requirements.txt
 
 This installs all required packages: pandas, requests, beautifulsoup4, numpy, scipy, matplotlib, seaborn, openpyxl, and tqdm.
 
-## Step 2: Run Your First Analysis
+## Step 2: Check Your Setup
 
-### Basic Analysis (50 funds)
 ```bash
-python analyze_polish_funds.py
+python doctor.py            # same as: python analyze_polish_funds.py --self-test
+```
+
+This verifies your Python version, dependencies, network, and each data source,
+printing a clear `[PASS]`/`[WARN]`/`[FAIL]` for each. On a healthy machine the
+`analizy.pl` source is green; Stooq will warn about its API key — that's expected.
+
+## Step 3: Run Your First Analysis
+
+### Recommended: analizy.pl funds (no API key needed)
+```bash
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt
 ```
 
 This will:
-- Download data for the first 50 funds
+- Download NAV history for each fund symbol in the file
 - Analyze returns and risk metrics
 - Generate `funds_analysis.csv` and `funds_analysis.html`
 - Show results in the terminal
 
-**Time**: ~2-3 minutes
+To screen your own funds, add their symbols (one per line) to a symbols file.
+Find a fund's symbol in its analizy.pl URL, e.g. `…/ING35` → `ING35`.
+
+### Alternative: Stooq (requires an API key)
+Stooq now gates its CSV endpoint. Get a key (one-time captcha) at
+<https://stooq.pl/q/d/?s=wig&get_apikey>, then:
+```bash
+export STOOQ_APIKEY=your_key_here       # or pass --stooq-apikey your_key
+python analyze_polish_funds.py --provider stooq \
+    --symbols-file your_stooq_symbols.txt
+```
+Even with a key, Stooq's bulk fund *listing* is unavailable (it's a JS app now),
+so you must supply symbols with `--symbols-file`.
 
 ### View Results
 
-Open `funds_analysis.html` in your web browser to see a beautiful formatted report with:
+Open `funds_analysis.html` in your web browser to see a formatted report with:
 - Summary statistics
 - Color-coded recommendations
 - All metrics in an easy-to-read table
 
-## Step 3: Try Different Options
+## Step 4: Try Different Options
+
+The examples below use the analizy provider; swap in your own `--symbols-file`.
 
 ### Generate Excel Report
 ```bash
-python analyze_polish_funds.py --format excel html
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt --format excel html
 ```
 Opens easily in Excel/LibreOffice Calc
 
 ### Create Visualizations
 ```bash
-python analyze_polish_funds.py --plots
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt --plots
 ```
 Creates charts in `plots/` directory
 
-### Analyze More Funds
+### Limit How Many Funds to Analyze
 ```bash
-python analyze_polish_funds.py --max-funds 100
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt --max-funds 10
 ```
-Analyzes first 100 funds (~5 minutes)
+Analyzes the first 10 symbols from the file (`--max-funds 0` = all of them).
 
-### Analyze ALL Funds
-```bash
-python analyze_polish_funds.py --max-funds 0 --workers 20
-```
-Analyzes all available funds (may take 10-30 minutes depending on total number)
-
-## Step 4: Customize Your Analysis
+## Step 5: Customize Your Analysis
 
 ### Use Different Scoring Strategies
 
 **Conservative** (focus on safety):
 ```bash
-python analyze_polish_funds.py --score-config scoring_configs/conservative.json
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt \
+    --score-config scoring_configs/conservative.json
 ```
 
 **Aggressive** (focus on growth):
 ```bash
-python analyze_polish_funds.py --score-config scoring_configs/aggressive.json
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt \
+    --score-config scoring_configs/aggressive.json
 ```
 
-**Balanced** (default - already used):
+**Balanced** (default weights):
 ```bash
-python analyze_polish_funds.py --score-config scoring_configs/balanced.json
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt \
+    --score-config scoring_configs/balanced.json
 ```
 
 ## Common Workflows
 
-### Daily Quick Check
+### Interactive Dashboard
 ```bash
-# Fast analysis using yesterday's cache
-python analyze_polish_funds.py --max-funds 50
+streamlit run dashboard.py
 ```
-
-### Weekly Deep Dive
-```bash
-# Comprehensive analysis with fresh data
-python analyze_polish_funds.py --no-cache --max-funds 200 --plots --format excel html
-```
+Opens a point-and-click UI in your browser. It starts in **Demo mode** (synthetic
+data) so you can explore without any network access — turn Demo mode off in the
+sidebar to use live data.
 
 ### Compare Strategies
 ```bash
 # Conservative
-python analyze_polish_funds.py --score-config scoring_configs/conservative.json \
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt \
+    --score-config scoring_configs/conservative.json \
     --output conservative_results
 
 # Aggressive
-python analyze_polish_funds.py --score-config scoring_configs/aggressive.json \
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt \
+    --score-config scoring_configs/aggressive.json \
     --output aggressive_results
 
 # Compare the HTML reports side-by-side!
@@ -106,7 +140,8 @@ python analyze_polish_funds.py --score-config scoring_configs/aggressive.json \
 
 ### Export for Spreadsheet Analysis
 ```bash
-python analyze_polish_funds.py --format excel json --max-funds 100
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt --format excel json
 ```
 
 ## Understanding Your Results
@@ -138,8 +173,19 @@ python analyze_polish_funds.py --format excel json --max-funds 100
 
 ## Troubleshooting
 
-### "No module named 'pandas'"
-Run: `pip install -r requirements.txt`
+### "No module named 'pandas'" (or matplotlib, seaborn, …)
+Run: `pip install -r requirements.txt`. If you use a virtualenv, make sure it's
+activated so the script runs under the interpreter that has the packages.
+
+### `RuntimeError: ... fund listing ... JavaScript app` (Stooq)
+Stooq's bulk listing no longer works. Use the analizy provider with a symbols
+file, or supply Stooq symbols with `--symbols-file`. Run `python doctor.py` to
+confirm which sources are up.
+
+### `Error: Stooq requires an API key`
+Stooq gated its CSV endpoint. Get a key at
+<https://stooq.pl/q/d/?s=wig&get_apikey> and set `STOOQ_APIKEY` (or pass
+`--stooq-apikey`), or simply use `--provider analizy`.
 
 ### "Connection timeout" or network errors
 - Check your internet connection
@@ -147,14 +193,14 @@ Run: `pip install -r requirements.txt`
 - Try again later
 
 ### Analysis is slow
-- Use fewer funds: `--max-funds 50`
+- Analyze fewer funds: `--max-funds 50`
 - Increase workers: `--workers 20`
-- Enable cache (default - it will be faster on second run)
+- Enable cache (default - it will be faster on the second run)
 
 ### Can't see plots
 - Make sure matplotlib is installed: `pip install matplotlib seaborn`
-- Use `--plots` flag
-- Check `plots/` directory for PNG files
+- Use the `--plots` flag
+- Check the `plots/` directory for PNG files
 
 ## Next Steps
 
@@ -168,7 +214,7 @@ Run: `pip install -r requirements.txt`
 
 💡 **Run twice**: First run downloads data (slower), second run uses cache (much faster)
 
-💡 **Start small**: Test with 50 funds first, then scale up
+💡 **Start small**: Test with a few symbols first, then add more to your symbols file
 
 💡 **Use Excel**: The Excel export makes it easy to sort, filter, and create custom charts
 
@@ -184,28 +230,29 @@ Run: `pip install -r requirements.txt`
 # Install dependencies (one time)
 pip install -r requirements.txt
 
-# First analysis
-python analyze_polish_funds.py --max-funds 100 --plots
+# Check everything works
+python doctor.py
+
+# First analysis (analizy.pl funds)
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt --plots
 
 # View results
-open funds_analysis.html  # Mac
+open funds_analysis.html      # Mac
 xdg-open funds_analysis.html  # Linux
-start funds_analysis.html  # Windows
+start funds_analysis.html     # Windows
 
-# Later the same day (uses cache - fast!)
-python analyze_polish_funds.py --max-funds 100
-
-# Try different strategy
-python analyze_polish_funds.py --max-funds 100 \
+# Try a different strategy
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt \
     --score-config scoring_configs/conservative.json \
     --output conservative_analysis
-
-# Compare the two HTML reports to see the difference!
 ```
 
 ## Getting Help
 
 - **Full documentation**: See README.md
+- **Environment check**: `python doctor.py`
 - **Command help**: `python analyze_polish_funds.py --help`
 - **Scoring strategies**: See scoring_configs/README.md
 - **Code documentation**: Read the docstrings in analyze_polish_funds.py
@@ -215,7 +262,8 @@ python analyze_polish_funds.py --max-funds 100 \
 **Ready to start? Run this now:**
 
 ```bash
-python analyze_polish_funds.py
+python doctor.py && python analyze_polish_funds.py \
+    --provider analizy --symbols-file sample_symbols_analizy.txt
 ```
 
 Then open `funds_analysis.html` in your browser! 🚀

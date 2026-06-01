@@ -69,6 +69,12 @@ RISK_FREE_RATE = 0.05  # 5% annual risk-free rate (adjust as needed)
 CACHE_DIR = Path(".fund_cache")
 CACHE_EXPIRY_DAYS = 1  # Cache expires after 1 day
 
+# Stooq, as of 2024+, gates its CSV download endpoint behind a (captcha-issued)
+# API key. When no key (or an invalid one) is supplied, the endpoint returns
+# HTTP 200 with this Polish sentinel ("Get an API key:") instead of CSV data.
+STOOQ_APIKEY_ENV = "STOOQ_APIKEY"
+STOOQ_APIKEY_SENTINEL = "uzyskaj apikey"
+
 
 @dataclass
 class FundInfo:
@@ -99,16 +105,52 @@ class FundMetrics:
     kurtosis: Optional[float] = None
     var_95: Optional[float] = None  # Value at Risk 95%
     cvar_95: Optional[float] = None  # Conditional VaR
+    # Benchmark-relative (populated only when a benchmark is set)
+    beta: Optional[float] = None  # Sensitivity to benchmark moves
+    alpha: Optional[float] = None  # Annualized CAPM excess return
+    tracking_error: Optional[float] = None  # Annualized std of active returns
+    information_ratio: Optional[float] = None  # Active return / tracking error
+    up_capture: Optional[float] = None  # Share of benchmark up-moves captured
+    down_capture: Optional[float] = None  # Share of benchmark down-moves captured
     # Recommendation
     recommendation: str = "Hold"
     score: float = 0.0
     percentile_rank: Optional[float] = None
 
 
+@dataclass
+class Holding:
+    """A single position in a personal portfolio."""
+    symbol: str
+    shares: float
+    cost_basis: float  # price paid per share
+    ter: Optional[float] = None  # annual expense ratio, e.g. 0.018 = 1.8%
+    name: str = ""
+
+
+@dataclass
+class PortfolioPosition:
+    """Computed state of one holding, including current value and P&L."""
+    symbol: str
+    name: str
+    shares: float
+    cost_basis: float
+    current_price: Optional[float] = None
+    cost_value: float = 0.0
+    current_value: Optional[float] = None
+    unrealized_pnl: Optional[float] = None
+    unrealized_pnl_pct: Optional[float] = None
+    weight: Optional[float] = None  # share of total portfolio value
+    return_1y: Optional[float] = None
+    ter: Optional[float] = None
+    annual_fee_cost: Optional[float] = None  # ter * current_value
+
+
 class FundAnalyzer:
     """Main class for analyzing Polish investment funds."""
 
-    def __init__(self, use_cache: bool = True, cache_dir: Path = CACHE_DIR):
+    def __init__(self, use_cache: bool = True, cache_dir: Path = CACHE_DIR,
+                 quote_source=None, stooq_apikey: Optional[str] = None):
         """
         Initialize the analyzer.
 
@@ -118,9 +160,19 @@ class FundAnalyzer:
             Whether to use caching for downloaded data
         cache_dir : Path
             Directory for cache storage
+        quote_source : callable, optional
+            A function ``fn(symbol) -> Optional[pd.DataFrame]`` used to fetch
+            quotes instead of the built-in Stooq endpoint (e.g. a provider from
+            ``providers.py``). Results still flow through the shared cache.
+        stooq_apikey : str, optional
+            API key for Stooq's CSV download endpoint, which now requires one.
+            Falls back to the ``STOOQ_APIKEY`` environment variable. Obtain a
+            key (one-time captcha) at https://stooq.pl/q/d/?s=wig&get_apikey
         """
         self.use_cache = use_cache
         self.cache_dir = cache_dir
+        self.quote_source = quote_source
+        self.stooq_apikey = stooq_apikey or os.environ.get(STOOQ_APIKEY_ENV)
         if use_cache:
             self.cache_dir.mkdir(exist_ok=True)
 
@@ -130,6 +182,40 @@ class FundAnalyzer:
                 "(KHTML, like Gecko) Chrome/118.0 Safari/537.36"
             )
         }
+
+        # Benchmark price data, set via set_benchmark(); enables relative metrics
+        self.benchmark_symbol: Optional[str] = None
+        self.benchmark_df: Optional[pd.DataFrame] = None
+
+    def set_benchmark(self, symbol: str) -> bool:
+        """
+        Download and store a benchmark price series (e.g. a market index).
+
+        Once set, ``analyze_fund`` will compute benchmark-relative metrics
+        (beta, alpha, tracking error, information ratio, up/down capture)
+        for every fund.
+
+        Parameters
+        ----------
+        symbol : str
+            Benchmark ticker on Stooq (e.g. "wig" for the WIG index).
+
+        Returns
+        -------
+        bool
+            True if the benchmark was downloaded successfully, else False.
+        """
+        df = self.download_quotes(symbol)
+        if df is None or len(df) < 60:
+            print(
+                f"Warning: could not load benchmark '{symbol}' "
+                f"(insufficient data); relative metrics disabled.",
+                file=sys.stderr,
+            )
+            return False
+        self.benchmark_symbol = symbol
+        self.benchmark_df = df
+        return True
 
     def get_fund_list(self, url: str = "https://stooq.pl/t/") -> List[FundInfo]:
         """
@@ -179,7 +265,22 @@ class FundAnalyzer:
             table = table.find_next("table")
 
         if not table:
-            raise RuntimeError("Could not locate fund listing table on the page")
+            # Stooq migrated this page to a JavaScript app: the server now
+            # returns an HTML shell with no <table> to scrape. Give the user a
+            # concrete path forward instead of a cryptic parse error.
+            has_table = "<table" in resp.text.lower()
+            if not has_table:
+                raise RuntimeError(
+                    "Stooq's fund listing at {url} no longer returns a server-"
+                    "rendered table (it is now a JavaScript app), so automated "
+                    "listing is unavailable. Supply symbols explicitly with "
+                    "--symbols-file, or use --provider analizy. "
+                    "Run `python doctor.py` to check data-source health.".format(url=url)
+                )
+            raise RuntimeError(
+                "Could not locate the fund listing table on {url} (its layout "
+                "may have changed). Try --symbols-file or --provider analizy.".format(url=url)
+            )
 
         funds = []
         for tr in table.find_all("tr"):
@@ -220,7 +321,10 @@ class FundAnalyzer:
         pd.DataFrame or None
             DataFrame with Date, Open, High, Low, Close, Volume columns
         """
-        cache_file = self.cache_dir / f"{symbol.replace('.', '_')}.pkl"
+        # Namespace cache by source so different providers don't collide
+        source_tag = getattr(self.quote_source, "name", "stooq") if self.quote_source else "stooq"
+        safe_symbol = symbol.replace('.', '_')
+        cache_file = self.cache_dir / f"{source_tag}__{safe_symbol}.pkl"
 
         # Check cache (with race condition protection)
         if self.use_cache and cache_file.exists():
@@ -235,8 +339,29 @@ class FundAnalyzer:
                 # Cache file was deleted, corrupted, or incomplete - ignore and re-download
                 pass
 
-        # Download with retries
+        # If an external provider is configured, use it (then cache the result)
+        if self.quote_source is not None:
+            try:
+                df = self.quote_source(symbol)
+            except Exception as exc:
+                print(f"Warning: provider failed for {symbol}: {exc}", file=sys.stderr)
+                return None
+            if df is None or len(df) == 0:
+                return None
+            if self.use_cache:
+                try:
+                    temp_file = cache_file.with_suffix('.tmp')
+                    with open(temp_file, "wb") as f:
+                        pickle.dump(df, f)
+                    temp_file.replace(cache_file)
+                except Exception:
+                    pass
+            return df
+
+        # Download with retries. Stooq now requires an API key on this endpoint.
         url = f"https://stooq.pl/q/d/l/?s={symbol.lower()}&i=d"
+        if self.stooq_apikey:
+            url += f"&apikey={self.stooq_apikey}"
 
         for attempt in range(max_retries):
             try:
@@ -248,6 +373,25 @@ class FundAnalyzer:
                 if not lines:
                     # Empty response, skip to next retry
                     continue
+
+                # Stooq gates this endpoint behind an API key: instead of CSV it
+                # returns a "Uzyskaj apikey:" notice (HTTP 200). Detect that and
+                # fail loudly with guidance rather than silently yielding no data.
+                if STOOQ_APIKEY_SENTINEL in csv_data[:200].lower():
+                    hint = (
+                        "set one via --stooq-apikey or the STOOQ_APIKEY env var"
+                        if not self.stooq_apikey
+                        else "the supplied STOOQ_APIKEY may be invalid/expired"
+                    )
+                    print(
+                        f"Error: Stooq requires an API key to download '{symbol}' "
+                        f"({hint}). Get a key (one-time captcha) at "
+                        "https://stooq.pl/q/d/?s=wig&get_apikey , or use "
+                        "--provider analizy instead.",
+                        file=sys.stderr,
+                    )
+                    return None
+
                 first_line = lines[0].lower()
                 has_header = first_line.startswith("date")
 
@@ -534,6 +678,356 @@ class FundAnalyzer:
             "kurtosis": stats.kurtosis(returns)
         }
 
+    def calculate_benchmark_metrics(
+        self, df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None
+    ) -> Dict[str, Optional[float]]:
+        """
+        Calculate metrics that compare a fund against a benchmark.
+
+        Daily returns are aligned on common trading dates (an inner join on
+        Date) so funds and the benchmark that trade on different days are
+        compared fairly.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Fund price data with Date and Close columns.
+        benchmark_df : pd.DataFrame, optional
+            Benchmark price data. Defaults to ``self.benchmark_df``.
+
+        Returns
+        -------
+        dict
+            beta, alpha (annualized), tracking_error (annualized),
+            information_ratio, up_capture, down_capture. Any value may be
+            None when it cannot be computed.
+        """
+        empty = {
+            "beta": None, "alpha": None, "tracking_error": None,
+            "information_ratio": None, "up_capture": None, "down_capture": None,
+        }
+
+        if benchmark_df is None:
+            benchmark_df = self.benchmark_df
+        if df is None or benchmark_df is None:
+            return empty
+
+        # Daily returns keyed by date (normalize to calendar day so series
+        # align even if timestamps carry a time component)
+        fund_ret = df[["Date", "Close"]].copy()
+        fund_ret["Date"] = pd.to_datetime(fund_ret["Date"]).dt.normalize()
+        fund_ret["r"] = fund_ret["Close"].pct_change()
+        bench_ret = benchmark_df[["Date", "Close"]].copy()
+        bench_ret["Date"] = pd.to_datetime(bench_ret["Date"]).dt.normalize()
+        bench_ret["b"] = bench_ret["Close"].pct_change()
+
+        merged = pd.merge(
+            fund_ret[["Date", "r"]], bench_ret[["Date", "b"]], on="Date", how="inner"
+        ).dropna()
+
+        # Need a meaningful overlap to produce stable statistics
+        if len(merged) < 60:
+            return empty
+
+        r = merged["r"].to_numpy()
+        b = merged["b"].to_numpy()
+        rf_daily = RISK_FREE_RATE / TRADING_DAYS_PER_YEAR
+
+        # Beta / alpha from excess returns (CAPM)
+        excess_r = r - rf_daily
+        excess_b = b - rf_daily
+        var_b = np.var(excess_b)
+        if var_b == 0:
+            beta = None
+            alpha = None
+        else:
+            beta = float(np.cov(excess_r, excess_b)[0, 1] / var_b)
+            alpha_daily = excess_r.mean() - beta * excess_b.mean()
+            alpha = float(alpha_daily * TRADING_DAYS_PER_YEAR)
+
+        # Tracking error and information ratio from active returns
+        active = r - b
+        te_daily = active.std(ddof=1)
+        tracking_error = float(te_daily * np.sqrt(TRADING_DAYS_PER_YEAR))
+        if tracking_error == 0:
+            information_ratio = None
+        else:
+            information_ratio = float(
+                (active.mean() * TRADING_DAYS_PER_YEAR) / tracking_error
+            )
+
+        # Up/down capture ratios
+        up = b > 0
+        down = b < 0
+        up_capture = (
+            float(r[up].mean() / b[up].mean())
+            if up.any() and b[up].mean() != 0 else None
+        )
+        down_capture = (
+            float(r[down].mean() / b[down].mean())
+            if down.any() and b[down].mean() != 0 else None
+        )
+
+        return {
+            "beta": beta,
+            "alpha": alpha,
+            "tracking_error": tracking_error,
+            "information_ratio": information_ratio,
+            "up_capture": up_capture,
+            "down_capture": down_capture,
+        }
+
+    def compute_correlation_matrix(
+        self, symbols: List[str], min_overlap: int = 60, high_threshold: float = 0.8
+    ) -> Tuple[Optional[pd.DataFrame], List[Tuple[str, str, float]]]:
+        """
+        Build a return-correlation matrix across funds and flag redundant pairs.
+
+        Highly correlated holdings move together, so holding several of them
+        adds little diversification. This downloads each symbol (cache makes
+        repeats cheap), aligns daily returns on common dates, and reports the
+        correlation matrix plus pairs above ``high_threshold``.
+
+        Parameters
+        ----------
+        symbols : List[str]
+            Fund tickers to compare.
+        min_overlap : int
+            Minimum number of shared trading days required for a pair.
+        high_threshold : float
+            Correlation above which a pair is flagged as redundant.
+
+        Returns
+        -------
+        tuple
+            (correlation DataFrame or None, list of (symbol_a, symbol_b,
+            correlation) sorted by descending correlation).
+        """
+        series = {}
+        for symbol in symbols:
+            df = self.download_quotes(symbol)
+            if df is None or len(df) < min_overlap:
+                continue
+            tmp = df[["Date", "Close"]].copy()
+            # Normalize to calendar day so series from different funds align
+            tmp["Date"] = pd.to_datetime(tmp["Date"]).dt.normalize()
+            s = tmp.set_index("Date")["Close"].pct_change().dropna()
+            if not s.empty:
+                series[symbol] = s
+
+        if len(series) < 2:
+            return None, []
+
+        # Align on common dates; columns with too little overlap drop out
+        returns_df = pd.DataFrame(series).dropna()
+        if len(returns_df) < min_overlap:
+            return None, []
+
+        corr = returns_df.corr()
+
+        # Collect unique upper-triangle pairs above the threshold
+        high_pairs: List[Tuple[str, str, float]] = []
+        cols = list(corr.columns)
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                value = corr.iloc[i, j]
+                if pd.notna(value) and value >= high_threshold:
+                    high_pairs.append((cols[i], cols[j], float(value)))
+
+        high_pairs.sort(key=lambda x: x[2], reverse=True)
+        return corr, high_pairs
+
+    # ------------------------------------------------------------------
+    # Portfolio tracking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def load_portfolio(path: str) -> List[Holding]:
+        """
+        Load a list of holdings from a JSON or CSV file.
+
+        JSON format (either a top-level list or a {"holdings": [...]} object)::
+
+            [
+              {"symbol": "1006.N", "shares": 100, "cost_basis": 45.5,
+               "ter": 0.018, "name": "Example Fund"}
+            ]
+
+        CSV format: a header row with columns
+        ``symbol,shares,cost_basis[,ter,name]``.
+
+        Parameters
+        ----------
+        path : str
+            Path to the holdings file.
+
+        Returns
+        -------
+        List[Holding]
+        """
+        p = Path(path)
+        holdings: List[Holding] = []
+
+        if p.suffix.lower() == ".json":
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data["holdings"] if isinstance(data, dict) else data
+            for row in rows:
+                holdings.append(Holding(
+                    symbol=str(row["symbol"]),
+                    shares=float(row["shares"]),
+                    cost_basis=float(row["cost_basis"]),
+                    ter=float(row["ter"]) if row.get("ter") is not None else None,
+                    name=str(row.get("name", "")),
+                ))
+        else:
+            # Treat anything else as CSV
+            holdings_df = pd.read_csv(p)
+            for _, row in holdings_df.iterrows():
+                ter = row["ter"] if "ter" in holdings_df.columns and pd.notna(row["ter"]) else None
+                name = row["name"] if "name" in holdings_df.columns and pd.notna(row["name"]) else ""
+                holdings.append(Holding(
+                    symbol=str(row["symbol"]),
+                    shares=float(row["shares"]),
+                    cost_basis=float(row["cost_basis"]),
+                    ter=float(ter) if ter is not None else None,
+                    name=str(name),
+                ))
+
+        return holdings
+
+    def analyze_portfolio(
+        self, holdings: List[Holding]
+    ) -> Tuple[List[PortfolioPosition], Dict[str, Optional[float]]]:
+        """
+        Value a portfolio: current price, P&L, allocation and weighted return.
+
+        Each holding's latest price is taken from its most recent close. Funds
+        whose data cannot be fetched are still reported, but with ``None`` for
+        price-derived fields and excluded from totals.
+
+        Parameters
+        ----------
+        holdings : List[Holding]
+
+        Returns
+        -------
+        tuple
+            (list of PortfolioPosition, summary dict with total_cost,
+            total_value, total_pnl, total_pnl_pct, total_annual_fees,
+            weighted_return_1y, num_positions, num_priced).
+        """
+        positions: List[PortfolioPosition] = []
+
+        for h in holdings:
+            df = self.download_quotes(h.symbol)
+            cost_value = h.shares * h.cost_basis
+
+            pos = PortfolioPosition(
+                symbol=h.symbol,
+                name=h.name or h.symbol,
+                shares=h.shares,
+                cost_basis=h.cost_basis,
+                cost_value=cost_value,
+                ter=h.ter,
+            )
+
+            if df is not None and len(df) > 0:
+                current_price = float(df["Close"].iloc[-1])
+                current_value = h.shares * current_price
+                pos.current_price = current_price
+                pos.current_value = current_value
+                pos.unrealized_pnl = current_value - cost_value
+                pos.unrealized_pnl_pct = (
+                    (current_value - cost_value) / cost_value if cost_value else None
+                )
+                pos.return_1y = self.calculate_returns(df)["1y"]
+                if h.ter is not None:
+                    pos.annual_fee_cost = h.ter * current_value
+
+            positions.append(pos)
+
+        # Totals over positions that have a current value
+        priced = [p for p in positions if p.current_value is not None]
+        total_value = sum(p.current_value for p in priced)
+        total_cost = sum(p.cost_value for p in priced)
+        total_pnl = total_value - total_cost if priced else None
+        total_pnl_pct = (total_pnl / total_cost) if (priced and total_cost) else None
+        total_annual_fees = sum(
+            p.annual_fee_cost for p in priced if p.annual_fee_cost is not None
+        )
+
+        # Allocation weights and value-weighted 1y return
+        weighted_return_1y = None
+        if total_value:
+            weighted_sum = 0.0
+            weight_with_return = 0.0
+            for p in priced:
+                p.weight = p.current_value / total_value
+                if p.return_1y is not None:
+                    weighted_sum += p.weight * p.return_1y
+                    weight_with_return += p.weight
+            if weight_with_return > 0:
+                # Normalize by covered weight so missing returns don't dilute
+                weighted_return_1y = weighted_sum / weight_with_return
+
+        summary = {
+            "num_positions": len(positions),
+            "num_priced": len(priced),
+            "total_cost": total_cost if priced else None,
+            "total_value": total_value if priced else None,
+            "total_pnl": total_pnl,
+            "total_pnl_pct": total_pnl_pct,
+            "total_annual_fees": total_annual_fees if priced else None,
+            "weighted_return_1y": weighted_return_1y,
+        }
+
+        return positions, summary
+
+    @staticmethod
+    def project_fee_drag(
+        amount: float, ter: float, years: int, gross_annual_return: float
+    ) -> Dict[str, float]:
+        """
+        Project the long-term cost of an expense ratio (TER).
+
+        Compounds ``amount`` for ``years`` at ``gross_annual_return`` both with
+        and without the annual fee, where the fee is charged on the balance each
+        year (net factor = (1 + gross) * (1 - ter)).
+
+        Parameters
+        ----------
+        amount : float
+            Starting investment.
+        ter : float
+            Annual expense ratio (e.g. 0.018 for 1.8%).
+        years : int
+            Investment horizon in years.
+        gross_annual_return : float
+            Assumed gross annual return before fees (e.g. 0.06 for 6%).
+
+        Returns
+        -------
+        dict
+            gross_value, net_value, total_fees (terminal value lost to fees),
+            drag_pct (fees as a share of the no-fee terminal value).
+        """
+        gross_value = amount
+        net_value = amount
+        for _ in range(max(int(years), 0)):
+            gross_value *= (1 + gross_annual_return)
+            net_value *= (1 + gross_annual_return) * (1 - ter)
+
+        total_fees = gross_value - net_value
+        drag_pct = (total_fees / gross_value) if gross_value else 0.0
+
+        return {
+            "gross_value": gross_value,
+            "net_value": net_value,
+            "total_fees": total_fees,
+            "drag_pct": drag_pct,
+        }
+
     def analyze_fund(self, fund: FundInfo) -> Optional[FundMetrics]:
         """
         Perform complete analysis on a single fund.
@@ -563,6 +1057,9 @@ class FundAnalyzer:
         var, cvar = self.calculate_var_cvar(df)
         stats_metrics = self.calculate_statistics(df)
 
+        # Benchmark-relative metrics (only when a benchmark has been set)
+        bench = self.calculate_benchmark_metrics(df)
+
         metrics = FundMetrics(
             symbol=fund.symbol,
             name=fund.name,
@@ -580,6 +1077,12 @@ class FundAnalyzer:
             kurtosis=stats_metrics["kurtosis"],
             var_95=var,
             cvar_95=cvar,
+            beta=bench["beta"],
+            alpha=bench["alpha"],
+            tracking_error=bench["tracking_error"],
+            information_ratio=bench["information_ratio"],
+            up_capture=bench["up_capture"],
+            down_capture=bench["down_capture"],
         )
 
         return metrics
@@ -766,12 +1269,6 @@ class FundAnalyzer:
         """
         data = [asdict(m) for m in results]
         df = pd.DataFrame(data)
-
-        # Format percentage columns
-        pct_cols = [
-            "return_1m", "return_3m", "return_6m", "return_1y", "return_ytd",
-            "volatility", "max_drawdown", "var_95", "cvar_95"
-        ]
 
         # Sort by score descending
         df = df.sort_values("score", ascending=False).reset_index(drop=True)
@@ -1064,8 +1561,98 @@ class FundAnalyzer:
         plt.close()
 
 
-def main():
-    """Main entry point for the script."""
+def run_portfolio(args):
+    """Run portfolio tracking and fee-drag analysis from a holdings file."""
+    analyzer = FundAnalyzer(
+        use_cache=not args.no_cache,
+        quote_source=build_quote_source(getattr(args, "provider", "stooq")),
+    )
+
+    try:
+        holdings = analyzer.load_portfolio(args.portfolio)
+    except Exception as exc:
+        print(f"Error: could not load portfolio '{args.portfolio}': {exc}",
+              file=sys.stderr)
+        return
+
+    if not holdings:
+        print("No holdings found in portfolio file.", file=sys.stderr)
+        return
+
+    print(f"Valuing {len(holdings)} holding(s)…", file=sys.stderr)
+    positions, summary = analyzer.analyze_portfolio(holdings)
+
+    # Build a DataFrame and export in the requested formats
+    df = pd.DataFrame([asdict(p) for p in positions])
+    # Order columns for readability
+    col_order = [
+        "symbol", "name", "shares", "cost_basis", "current_price",
+        "cost_value", "current_value", "unrealized_pnl", "unrealized_pnl_pct",
+        "weight", "return_1y", "ter", "annual_fee_cost",
+    ]
+    df = df[[c for c in col_order if c in df.columns]]
+    if summary.get("total_value"):
+        df = df.sort_values("current_value", ascending=False).reset_index(drop=True)
+
+    for fmt in args.format:
+        output_path = f"{args.output}.{fmt}"
+        if fmt == "csv":
+            analyzer.export_to_csv(df, output_path)
+        elif fmt == "excel":
+            analyzer.export_to_excel(df, output_path)
+        elif fmt == "json":
+            analyzer.export_to_json(df, output_path)
+        # HTML report is geared to fund screening; skip for portfolio mode
+
+    # Console summary
+    def fmt_money(x):
+        return f"{x:,.2f}" if x is not None else "N/A"
+
+    def fmt_pct(x):
+        return f"{x*100:.2f}%" if x is not None else "N/A"
+
+    print("\n" + "=" * 80, file=sys.stderr)
+    print("PORTFOLIO SUMMARY", file=sys.stderr)
+    print("=" * 80, file=sys.stderr)
+    print(f"Positions: {summary['num_positions']} "
+          f"(priced: {summary['num_priced']})", file=sys.stderr)
+    print(f"Total cost:    {fmt_money(summary['total_cost'])}", file=sys.stderr)
+    print(f"Total value:   {fmt_money(summary['total_value'])}", file=sys.stderr)
+    print(f"Unrealized P&L: {fmt_money(summary['total_pnl'])} "
+          f"({fmt_pct(summary['total_pnl_pct'])})", file=sys.stderr)
+    print(f"Value-weighted 1Y return: {fmt_pct(summary['weighted_return_1y'])}",
+          file=sys.stderr)
+    if summary.get("total_annual_fees"):
+        print(f"Estimated annual fees (TER): {fmt_money(summary['total_annual_fees'])}",
+              file=sys.stderr)
+
+    # Fee-drag projection on the current portfolio value
+    total_value = summary.get("total_value")
+    fee_positions = [p for p in positions if p.ter is not None and p.current_value]
+    if total_value and fee_positions:
+        # Value-weighted average TER across positions that have one
+        weighted_ter = sum(p.ter * p.current_value for p in fee_positions) / \
+            sum(p.current_value for p in fee_positions)
+        proj = analyzer.project_fee_drag(
+            amount=total_value,
+            ter=weighted_ter,
+            years=args.project_years,
+            gross_annual_return=args.assumed_return,
+        )
+        print("\n" + "-" * 80, file=sys.stderr)
+        print(f"FEE-DRAG PROJECTION ({args.project_years} yrs @ "
+              f"{args.assumed_return*100:.1f}% gross, avg TER "
+              f"{weighted_ter*100:.2f}%)", file=sys.stderr)
+        print("-" * 80, file=sys.stderr)
+        print(f"Value without fees: {fmt_money(proj['gross_value'])}", file=sys.stderr)
+        print(f"Value with fees:    {fmt_money(proj['net_value'])}", file=sys.stderr)
+        print(f"Lost to fees:       {fmt_money(proj['total_fees'])} "
+              f"({fmt_pct(proj['drag_pct'])} of the fee-free total)", file=sys.stderr)
+    print("=" * 80 + "\n", file=sys.stderr)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the command-line argument parser."""
     parser = argparse.ArgumentParser(
         description="Enhanced analysis of Polish investment funds from Stooq",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1138,7 +1725,136 @@ Examples:
         help="Clear the cache directory and exit"
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        default=None,
+        help="Benchmark ticker (e.g. 'wig') to compute relative metrics "
+             "(beta, alpha, tracking error, information ratio, up/down capture)"
+    )
+
+    parser.add_argument(
+        "--correlation",
+        action="store_true",
+        help="Compute a correlation matrix across analyzed funds and flag "
+             "redundant (highly correlated) holdings"
+    )
+
+    parser.add_argument(
+        "--portfolio",
+        type=str,
+        default=None,
+        help="Path to a holdings file (JSON or CSV) to run portfolio "
+             "tracking: current value, P&L, allocation and fee analysis"
+    )
+
+    parser.add_argument(
+        "--project-years",
+        type=int,
+        default=10,
+        help="Horizon in years for portfolio fee-drag projection (default: 10)"
+    )
+
+    parser.add_argument(
+        "--assumed-return",
+        type=float,
+        default=0.06,
+        help="Assumed gross annual return for fee-drag projection (default: 0.06)"
+    )
+
+    parser.add_argument(
+        "--provider",
+        choices=["stooq", "analizy"],
+        default="stooq",
+        help="Data source for fund quotes: 'stooq' (default) or 'analizy' "
+             "(analizy.pl TFI NAV API; uses analizy.pl symbols like ING35)"
+    )
+
+    parser.add_argument(
+        "--symbols-file",
+        type=str,
+        default=None,
+        help="Path to a file of fund symbols to screen (one per line, or a JSON "
+             "list). Required for --provider analizy (no bulk list endpoint)."
+    )
+
+    parser.add_argument(
+        "--stooq-apikey",
+        type=str,
+        default=None,
+        help="API key for Stooq's CSV endpoint (now required). Falls back to "
+             "the STOOQ_APIKEY env var. Get one at "
+             "https://stooq.pl/q/d/?s=wig&get_apikey"
+    )
+
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run environment & data-source health checks (deps, network, each "
+             "provider) and exit with a clear pass/fail. Same as `python doctor.py`."
+    )
+
+    return parser
+
+
+def load_symbols_file(path: str) -> list:
+    """
+    Load fund symbols from a file: either a JSON array, or plain text with one
+    symbol per line (``#`` comments and blank lines ignored).
+    """
+    text = Path(path).read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text[0] == "[":
+        data = json.loads(text)
+        return [str(s).strip() for s in data if str(s).strip()]
+    symbols = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            symbols.append(line)
+    return symbols
+
+
+def build_quote_source(provider: str):
+    """
+    Return a quote-source callable for the chosen provider, or None for Stooq
+    (which uses FundAnalyzer's built-in path).
+
+    Parameters
+    ----------
+    provider : str
+        "stooq" or "analizy".
+    """
+    if provider == "analizy":
+        from providers import AnalizyProvider
+        prov = AnalizyProvider()
+        # Wrap so the cache can namespace by source: a bound method has no
+        # usable ``.name`` of its own, so download_quotes' cache tag would
+        # otherwise fall back to "stooq".
+        return _NamedSource(prov.download_quotes, prov.name)
+    return None
+
+
+class _NamedSource:
+    """Wraps a quote-source callable with a stable ``name`` for cache tagging."""
+
+    def __init__(self, fn, name: str):
+        self._fn = fn
+        self.name = name
+
+    def __call__(self, symbol):
+        return self._fn(symbol)
+
+
+def main():
+    """Main entry point for the script."""
+    args = build_parser().parse_args()
+
+    # Environment / data-source health check
+    if args.self_test:
+        from doctor import run_doctor
+        sys.exit(run_doctor(stooq_apikey=args.stooq_apikey))
 
     # Handle cache clearing
     if args.clear_cache:
@@ -1150,22 +1866,64 @@ Examples:
             print(f"Cache directory {CACHE_DIR} does not exist.", file=sys.stderr)
         return
 
+    # Portfolio tracking mode: value holdings instead of screening all funds
+    if args.portfolio:
+        run_portfolio(args)
+        return
+
     # Load custom scoring weights if provided
     score_weights = None
     if args.score_config:
         try:
             with open(args.score_config, 'r') as f:
                 score_weights = json.load(f)
+            # The shipped scoring_configs/*.json nest the weights under a
+            # "weights" key (alongside description/comment); a flat mapping (as
+            # in the README) is used directly.
+            if isinstance(score_weights, dict) and "weights" in score_weights:
+                score_weights = score_weights["weights"]
             print(f"Loaded custom scoring weights from {args.score_config}", file=sys.stderr)
         except Exception as e:
             print(f"Warning: Could not load score config: {e}", file=sys.stderr)
 
-    # Initialize analyzer
-    analyzer = FundAnalyzer(use_cache=not args.no_cache)
+    # Initialize analyzer (optionally with an alternative data provider)
+    analyzer = FundAnalyzer(
+        use_cache=not args.no_cache,
+        quote_source=build_quote_source(args.provider),
+        stooq_apikey=args.stooq_apikey,
+    )
+    if args.provider != "stooq":
+        print(f"Using data provider: {args.provider}", file=sys.stderr)
 
-    # Get fund list
-    print("Downloading list of funds…", file=sys.stderr)
-    funds = analyzer.get_fund_list()
+    # Load benchmark for relative metrics, if requested
+    if args.benchmark:
+        print(f"Loading benchmark '{args.benchmark}'…", file=sys.stderr)
+        if analyzer.set_benchmark(args.benchmark):
+            print(f"Benchmark '{args.benchmark}' loaded; computing relative metrics.",
+                  file=sys.stderr)
+
+    # Get fund list. analizy.pl has no bulk list endpoint, so it requires an
+    # explicit --symbols-file; Stooq uses its built-in listing page.
+    if args.symbols_file:
+        symbols = load_symbols_file(args.symbols_file)
+        print(f"Loaded {len(symbols)} symbols from {args.symbols_file}", file=sys.stderr)
+        if args.provider == "analizy":
+            from providers import AnalizyProvider
+            funds = AnalizyProvider().get_fund_list(symbols)
+        else:
+            funds = [FundInfo(symbol=s, name=s) for s in symbols]
+    elif args.provider == "analizy":
+        print("Error: --provider analizy requires --symbols-file (no bulk list "
+              "endpoint exists). Provide a text/JSON file of analizy.pl symbols.",
+              file=sys.stderr)
+        return
+    else:
+        print("Downloading list of funds…", file=sys.stderr)
+        try:
+            funds = analyzer.get_fund_list()
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
     print(f"Found {len(funds)} funds.", file=sys.stderr)
 
     # Limit funds if requested
@@ -1196,9 +1954,11 @@ Examples:
     print(top10.to_string(index=False), file=sys.stderr)
     print("="*80 + "\n", file=sys.stderr)
 
-    # Export to requested formats
+    # Export to requested formats. The file extension differs from the format
+    # name for Excel (.xlsx, not .excel — pandas/openpyxl rejects ".excel").
+    format_extensions = {"csv": "csv", "excel": "xlsx", "json": "json", "html": "html"}
     for fmt in args.format:
-        output_path = f"{args.output}.{fmt}"
+        output_path = f"{args.output}.{format_extensions.get(fmt, fmt)}"
         if fmt == 'csv':
             analyzer.export_to_csv(df, output_path)
         elif fmt == 'excel':
@@ -1211,6 +1971,26 @@ Examples:
     # Create visualizations if requested
     if args.plots:
         analyzer.create_visualizations(df, output_dir="plots")
+
+    # Correlation / diversification report if requested
+    if args.correlation:
+        print("\nComputing correlation across analyzed funds…", file=sys.stderr)
+        symbols = [m.symbol for m in results]
+        corr, high_pairs = analyzer.compute_correlation_matrix(symbols)
+        if corr is None:
+            print("Not enough overlapping data to compute correlations.", file=sys.stderr)
+        else:
+            corr_path = f"{args.output}_correlation.csv"
+            corr.to_csv(corr_path)
+            print(f"Correlation matrix written to {corr_path}", file=sys.stderr)
+            if high_pairs:
+                print("\nHighly correlated pairs (>=0.80) — limited diversification:",
+                      file=sys.stderr)
+                for sym_a, sym_b, value in high_pairs[:20]:
+                    print(f"  {sym_a} ~ {sym_b}: {value:.2f}", file=sys.stderr)
+            else:
+                print("No highly correlated pairs found (good diversification).",
+                      file=sys.stderr)
 
 
 if __name__ == "__main__":

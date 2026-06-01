@@ -5,13 +5,10 @@ Tests all functionality without network dependencies
 """
 
 import sys
-import os
 import json
 import time
-import pickle
 from pathlib import Path
-from datetime import datetime, timedelta
-import shutil
+from datetime import datetime
 
 # Add current directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -645,6 +642,244 @@ def run_tests():
         results.add("Realistic Volatility Scenarios", True, duration=time.time()-start)
     except Exception as e:
         results.add("Realistic Volatility Scenarios", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 26: Benchmark Metrics - structure and ranges
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        bench_df = MockData.generate_price_data(days=400, volatility=0.015, trend=0.0003)
+        fund_df = MockData.generate_price_data(days=400, volatility=0.02, trend=0.0004)
+
+        metrics = analyzer.calculate_benchmark_metrics(fund_df, bench_df)
+
+        # All six keys present
+        for key in ["beta", "alpha", "tracking_error", "information_ratio",
+                    "up_capture", "down_capture"]:
+            assert key in metrics
+        # Beta and tracking error should be computable and finite
+        assert metrics["beta"] is not None and np.isfinite(metrics["beta"])
+        assert metrics["tracking_error"] is not None and metrics["tracking_error"] >= 0
+        results.add("Benchmark Metrics Structure", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Benchmark Metrics Structure", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 27: Benchmark Metrics - beta of identical series is ~1
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        bench_df = MockData.generate_price_data(days=400, volatility=0.015)
+        # Fund identical to benchmark -> beta ~1, tracking error ~0
+        metrics = analyzer.calculate_benchmark_metrics(bench_df.copy(), bench_df)
+
+        assert metrics["beta"] is not None
+        assert abs(metrics["beta"] - 1.0) < 0.01, f"beta={metrics['beta']}"
+        assert metrics["tracking_error"] is not None
+        assert metrics["tracking_error"] < 1e-6, f"te={metrics['tracking_error']}"
+        results.add("Benchmark Beta Identity", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Benchmark Beta Identity", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 28: Benchmark Metrics - insufficient overlap returns Nones
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        bench_df = MockData.generate_price_data(days=400, volatility=0.015)
+        short_df = MockData.generate_price_data(days=30, volatility=0.02)
+
+        metrics = analyzer.calculate_benchmark_metrics(short_df, bench_df)
+        # < 60 overlapping days -> all None
+        assert all(metrics[k] is None for k in metrics)
+        results.add("Benchmark Insufficient Overlap", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Benchmark Insufficient Overlap", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 29: Correlation Matrix - identical funds correlate ~1
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        base = MockData.generate_price_data(days=300, volatility=0.02)
+
+        # Monkeypatch download_quotes to serve in-memory mock series
+        store = {
+            "A.N": base,
+            "B.N": base.copy(),  # identical -> correlation ~1
+            "C.N": MockData.generate_price_data(days=300, volatility=0.02),
+        }
+        analyzer.download_quotes = lambda symbol, max_retries=3: store.get(symbol)
+
+        corr, high_pairs = analyzer.compute_correlation_matrix(["A.N", "B.N", "C.N"])
+
+        assert corr is not None
+        # A and B are identical -> flagged as highly correlated
+        flagged = {(a, b) for a, b, _ in high_pairs}
+        assert ("A.N", "B.N") in flagged or ("B.N", "A.N") in flagged
+        results.add("Correlation Identical Funds", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Correlation Identical Funds", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 30: Correlation Matrix - too few funds returns empty
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        store = {"A.N": MockData.generate_price_data(days=300)}
+        analyzer.download_quotes = lambda symbol, max_retries=3: store.get(symbol)
+
+        corr, high_pairs = analyzer.compute_correlation_matrix(["A.N"])
+        assert corr is None and high_pairs == []
+        results.add("Correlation Too Few Funds", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Correlation Too Few Funds", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 31: analyze_fund populates benchmark fields when benchmark set
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+        bench_df = MockData.generate_price_data(days=400, volatility=0.015)
+        fund_df = MockData.generate_price_data(days=400, volatility=0.02)
+
+        analyzer.benchmark_df = bench_df
+        analyzer.download_quotes = lambda symbol, max_retries=3: fund_df
+        m = analyzer.analyze_fund(FundInfo(symbol="X.N", name="Fund X"))
+
+        assert m is not None
+        assert m.beta is not None
+        assert m.tracking_error is not None
+        results.add("analyze_fund Benchmark Integration", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("analyze_fund Benchmark Integration", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 32: Portfolio valuation - P&L, weights, totals
+    # ========================================================================
+    start = time.time()
+    try:
+        from analyze_polish_funds import Holding
+
+        analyzer = FundAnalyzer(use_cache=False)
+        # Two funds with known latest close prices
+        df_a = MockData.generate_price_data(days=300)
+        df_b = MockData.generate_price_data(days=300)
+        df_a.loc[df_a.index[-1], "Close"] = 60.0  # latest price A = 60
+        df_b.loc[df_b.index[-1], "Close"] = 20.0  # latest price B = 20
+        store = {"A.N": df_a, "B.N": df_b}
+        analyzer.download_quotes = lambda symbol, max_retries=3: store.get(symbol)
+
+        holdings = [
+            Holding(symbol="A.N", shares=100, cost_basis=50.0, ter=0.02),  # cost 5000, val 6000
+            Holding(symbol="B.N", shares=200, cost_basis=25.0, ter=0.01),  # cost 5000, val 4000
+        ]
+        positions, summary = analyzer.analyze_portfolio(holdings)
+
+        assert summary["num_priced"] == 2
+        assert abs(summary["total_cost"] - 10000.0) < 1e-6
+        assert abs(summary["total_value"] - 10000.0) < 1e-6  # 6000 + 4000
+        assert abs(summary["total_pnl"] - 0.0) < 1e-6  # +1000 (A) - 1000 (B)
+        # Position A weight = 6000/10000 = 0.6
+        pos_a = next(p for p in positions if p.symbol == "A.N")
+        assert abs(pos_a.weight - 0.6) < 1e-6
+        assert abs(pos_a.unrealized_pnl - 1000.0) < 1e-6
+        # Annual fees: 0.02*6000 + 0.01*4000 = 120 + 40 = 160
+        assert abs(summary["total_annual_fees"] - 160.0) < 1e-6
+        results.add("Portfolio Valuation", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Portfolio Valuation", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 33: Portfolio handles unpriced (missing) holdings gracefully
+    # ========================================================================
+    start = time.time()
+    try:
+        from analyze_polish_funds import Holding
+
+        analyzer = FundAnalyzer(use_cache=False)
+        df_a = MockData.generate_price_data(days=300)
+        df_a.loc[df_a.index[-1], "Close"] = 10.0
+        store = {"A.N": df_a}  # B.N missing
+        analyzer.download_quotes = lambda symbol, max_retries=3: store.get(symbol)
+
+        holdings = [
+            Holding(symbol="A.N", shares=10, cost_basis=8.0),
+            Holding(symbol="B.N", shares=10, cost_basis=8.0),  # no data
+        ]
+        positions, summary = analyzer.analyze_portfolio(holdings)
+
+        assert summary["num_positions"] == 2
+        assert summary["num_priced"] == 1
+        pos_b = next(p for p in positions if p.symbol == "B.N")
+        assert pos_b.current_value is None
+        assert pos_b.unrealized_pnl is None
+        results.add("Portfolio Missing Data Handling", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Portfolio Missing Data Handling", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 34: Fee-drag projection math
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+
+        # Zero TER -> net equals gross, no fees
+        z = analyzer.project_fee_drag(10000, ter=0.0, years=10, gross_annual_return=0.06)
+        assert abs(z["gross_value"] - z["net_value"]) < 1e-6
+        assert abs(z["total_fees"]) < 1e-6
+
+        # Positive TER -> net < gross, fees > 0, drag between 0 and 1
+        p = analyzer.project_fee_drag(10000, ter=0.02, years=20, gross_annual_return=0.06)
+        assert p["net_value"] < p["gross_value"]
+        assert p["total_fees"] > 0
+        assert 0 < p["drag_pct"] < 1
+
+        # Known one-year check: net = 10000 * 1.06 * 0.98
+        one = analyzer.project_fee_drag(10000, ter=0.02, years=1, gross_annual_return=0.06)
+        assert abs(one["net_value"] - 10000 * 1.06 * 0.98) < 1e-6
+        results.add("Fee-Drag Projection Math", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Fee-Drag Projection Math", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 35: load_portfolio from JSON and CSV
+    # ========================================================================
+    start = time.time()
+    try:
+        analyzer = FundAnalyzer(use_cache=False)
+
+        # JSON (object with "holdings")
+        json_path = test_dir / "holdings.json"
+        with open(json_path, "w") as f:
+            json.dump({"holdings": [
+                {"symbol": "A.N", "shares": 10, "cost_basis": 5.0, "ter": 0.015, "name": "A"},
+                {"symbol": "B.N", "shares": 20, "cost_basis": 7.5},
+            ]}, f)
+        h_json = analyzer.load_portfolio(str(json_path))
+        assert len(h_json) == 2
+        assert h_json[0].symbol == "A.N" and h_json[0].ter == 0.015
+        assert h_json[1].ter is None  # missing TER -> None
+
+        # CSV
+        csv_path = test_dir / "holdings.csv"
+        pd.DataFrame([
+            {"symbol": "C.N", "shares": 5, "cost_basis": 100.0, "ter": 0.02, "name": "C"},
+            {"symbol": "D.N", "shares": 8, "cost_basis": 50.0, "ter": None, "name": "D"},
+        ]).to_csv(csv_path, index=False)
+        h_csv = analyzer.load_portfolio(str(csv_path))
+        assert len(h_csv) == 2
+        assert h_csv[0].symbol == "C.N" and abs(h_csv[0].cost_basis - 100.0) < 1e-6
+        results.add("Load Portfolio JSON/CSV", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Load Portfolio JSON/CSV", False, str(e), time.time()-start)
 
     # Print summary
     print()

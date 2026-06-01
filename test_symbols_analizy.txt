@@ -1,0 +1,13 @@
+# analizy.pl fund symbols used by the integration test suite (test_analyzer.py).
+# All verified live against https://www.analizy.pl/api/quotation/fio/<SYM> with
+# several years of NAV history each — a small but real, diverse basket (global,
+# regional, and bond funds) so parallel-vs-sequential and multi-fund tests are
+# meaningful. Blank lines and lines starting with '#' are ignored.
+ING35
+ING36
+ING37
+ING43
+ING45
+ING48
+ING54
+ING55

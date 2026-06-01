@@ -1,6 +1,14 @@
 # Polish Investment Funds Analyzer
 
-A comprehensive Python tool for analyzing Polish investment funds listed on [Stooq.pl](https://stooq.pl). This enhanced version provides advanced financial metrics, risk analysis, and intelligent recommendations.
+A comprehensive Python tool for analyzing Polish investment funds. This enhanced version provides advanced financial metrics, risk analysis, and intelligent recommendations.
+
+> ⚠️ **Data-source status.** Stooq's free feed no longer works out of the box —
+> its fund-listing page is now a JavaScript app (nothing to scrape) and its CSV
+> quote endpoint requires a captcha-issued API key. **Use the `analizy.pl`
+> provider** (`--provider analizy --symbols-file …`), which needs no key, or
+> supply a Stooq key via `--stooq-apikey` / `STOOQ_APIKEY`. Run
+> `python doctor.py` (or `--self-test`) to check what's reachable on your
+> machine. See [Data Sources](#data-sources) for details.
 
 ## Features
 
@@ -62,45 +70,80 @@ cd InvestFund
 pip install -r requirements.txt
 ```
 
+## Interactive Dashboard
+
+For a point-and-click experience, run the Streamlit dashboard instead of the CLI:
+
+```bash
+pip install streamlit          # if not already installed
+streamlit run dashboard.py
+```
+
+It opens in your browser with two views:
+
+- **Fund Screener** — run the analysis, filter by recommendation and minimum
+  score, sort the table, view risk/return and score charts, and download
+  CSV/JSON. Supports an optional benchmark ticker.
+- **Portfolio Tracker** — upload a holdings file (JSON/CSV) to see value, P&L,
+  allocation, and an interactive fee-drag projection (adjust horizon and assumed
+  return with sliders).
+
+A **Demo mode** toggle (on by default) generates synthetic data, so you can try
+the whole interface without any network access. Turn it off to use live data.
+
 ## Usage
+
+### Check your setup first
+
+```bash
+python doctor.py            # same as: python analyze_polish_funds.py --self-test
+```
+
+Verifies Python, dependencies, network, and each data source with a clear
+`[PASS]`/`[WARN]`/`[FAIL]` line — the fastest way to answer "will this work?".
 
 ### Basic Usage
 
-Analyze the first 50 funds (default):
+Analyze a set of funds via the `analizy.pl` provider (recommended — no API key):
 ```bash
-python analyze_polish_funds.py
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt
 ```
+
+`--symbols-file` lists the funds to screen, one symbol per line (see
+[Screening with analizy.pl](#alternative-provider-analizypl-polish-tfi-funds)).
+The examples below add the same two flags.
 
 ### Common Examples
 
-**Analyze all funds:**
+**Analyze every symbol in the file:**
 ```bash
-python analyze_polish_funds.py --max-funds 0
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --max-funds 0
 ```
 
 **Generate Excel and HTML reports:**
 ```bash
-python analyze_polish_funds.py --format excel html --output my_analysis
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --format excel html --output my_analysis
 ```
 
 **Create visualizations:**
 ```bash
-python analyze_polish_funds.py --plots
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --plots
 ```
 
 **Disable caching for fresh data:**
 ```bash
-python analyze_polish_funds.py --no-cache
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --no-cache
 ```
 
 **Use more parallel workers (faster):**
 ```bash
-python analyze_polish_funds.py --workers 20
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --workers 20
 ```
 
-**Custom output filename:**
+**Use Stooq with an API key** (get one at <https://stooq.pl/q/d/?s=wig&get_apikey>):
 ```bash
-python analyze_polish_funds.py --output results/fund_report_2024
+python analyze_polish_funds.py --provider stooq --stooq-apikey YOURKEY --symbols-file your_stooq_symbols.txt
 ```
 
 ### Advanced Usage
@@ -140,6 +183,96 @@ python analyze_polish_funds.py --clear-cache
 | `--plots` | Generate visualization plots | False |
 | `--score-config PATH` | Path to custom scoring weights JSON | None |
 | `--clear-cache` | Clear cache directory and exit | False |
+| `--benchmark TICKER` | Compute benchmark-relative metrics vs a market index | None |
+| `--correlation` | Build a correlation matrix and flag redundant holdings | False |
+| `--portfolio PATH` | Track a holdings file (JSON/CSV): value, P&L, allocation, fees | None |
+| `--project-years N` | Horizon for portfolio fee-drag projection | 10 |
+| `--assumed-return R` | Assumed gross annual return for fee projection | 0.06 |
+| `--provider NAME` | Data source: `stooq` or `analizy` | `stooq` |
+| `--symbols-file PATH` | File of fund symbols to screen (one per line or JSON list); required for `analizy` | None |
+| `--stooq-apikey KEY` | Stooq CSV API key (also via `STOOQ_APIKEY` env var) | None |
+| `--self-test` | Run environment & data-source health checks and exit (same as `doctor.py`) | False |
+
+## Benchmark Comparison
+
+Pass a market index with `--benchmark` to answer the key question: *is a fund
+actually beating the market, or just riding it?*
+
+```bash
+# Compare every fund against the WIG index
+python analyze_polish_funds.py --benchmark wig --format html
+```
+
+This adds the following columns to every report:
+
+| Metric | Meaning |
+|--------|---------|
+| `beta` | Sensitivity to benchmark moves (1.0 = moves with the market) |
+| `alpha` | Annualized excess return *after* adjusting for beta (CAPM). Positive = genuine outperformance |
+| `tracking_error` | Annualized volatility of the fund's active return vs the benchmark |
+| `information_ratio` | Active return per unit of tracking error (consistency of outperformance) |
+| `up_capture` | Share of the benchmark's up-moves captured (>1 = amplifies gains) |
+| `down_capture` | Share of the benchmark's down-moves captured (<1 = cushions losses) |
+
+Returns and the benchmark are aligned on common trading days, so funds that
+trade on different calendars are still compared fairly. A fund needs at least
+60 overlapping days for these metrics to be computed.
+
+## Correlation & Diversification
+
+Use `--correlation` to see which funds move together. Holding several highly
+correlated funds adds little diversification — this surfaces the redundant pairs.
+
+```bash
+python analyze_polish_funds.py --max-funds 30 --correlation
+```
+
+This writes a full correlation matrix to `<output>_correlation.csv` and prints
+any pairs with correlation ≥ 0.80 (limited diversification) to the console.
+
+## Portfolio Tracking
+
+Track what you actually own. Provide a holdings file with `--portfolio` and the
+tool values each position, computes profit/loss, allocation, and a value-weighted
+return — then exports the result and prints a summary.
+
+```bash
+# Value your holdings (see sample_portfolio.json for the format)
+python analyze_polish_funds.py --portfolio sample_portfolio.json --format csv json
+```
+
+**Holdings file** — JSON (a list, or `{"holdings": [...]}`) or CSV with columns
+`symbol,shares,cost_basis[,ter,name]`:
+
+```json
+{
+  "holdings": [
+    {"symbol": "1006.N", "shares": 100, "cost_basis": 45.50, "ter": 0.018, "name": "Equity Fund"},
+    {"symbol": "1007.N", "shares": 250, "cost_basis": 12.30, "ter": 0.012, "name": "Bond Fund"}
+  ]
+}
+```
+
+- `cost_basis` — price paid per share
+- `ter` *(optional)* — annual expense ratio (e.g. `0.018` = 1.8%), used for fee analysis
+
+Each position reports current price, current value, unrealized P&L (absolute and
+%), portfolio weight, 1-year return, and estimated annual fee cost. Holdings whose
+data can't be fetched are still listed but excluded from totals.
+
+## Fee-Drag Projection
+
+Expense ratios are small per year but compound brutally over decades. When your
+holdings include a `ter`, portfolio mode projects how much those fees cost you:
+
+```bash
+python analyze_polish_funds.py --portfolio sample_portfolio.json \
+    --project-years 20 --assumed-return 0.06
+```
+
+It compounds your current portfolio value over the horizon at the assumed gross
+return, both with and without the (value-weighted average) TER, and reports the
+terminal value lost to fees. Defaults: `--project-years 10`, `--assumed-return 0.06`.
 
 ## Output Files
 
@@ -278,6 +411,17 @@ python analyze_polish_funds.py --no-cache --max-funds 50
 - Enable caching (default)
 - Reduce fund count: `--max-funds 50`
 
+### Not sure what's broken?
+Run `python doctor.py` (or `python analyze_polish_funds.py --self-test`) — it
+checks dependencies, network, and each data source and prints a clear pass/fail.
+
+### Stooq: "fund listing ... JavaScript app" or "requires an API key"
+Stooq retired its free endpoints. Either use `--provider analizy` with a
+`--symbols-file`, or get a Stooq key (one-time captcha) at
+<https://stooq.pl/q/d/?s=wig&get_apikey> and pass it via `--stooq-apikey` /
+`STOOQ_APIKEY`. Stooq's bulk *listing* is unavailable either way, so supply
+symbols explicitly with `--symbols-file`.
+
 ### Network Errors
 - Check internet connection
 - Some funds may be temporarily unavailable (warnings will be shown)
@@ -300,7 +444,7 @@ python analyze_polish_funds.py --no-cache --max-funds 50
 
 3. **Past Performance**: Historical returns do not guarantee future results.
 
-4. **Data Accuracy**: Data is sourced from Stooq.pl. Verify important data independently.
+4. **Data Accuracy**: Data is sourced from third-party providers (Stooq.pl and analizy.pl). Verify important data independently.
 
 5. **Simplified Model**: The recommendation system uses simplified rules and may not account for:
    - Your personal financial situation
@@ -315,10 +459,92 @@ python analyze_polish_funds.py --no-cache --max-funds 50
 
 ## Technical Details
 
-### Data Source
-- **Provider**: Stooq.pl
+### Data Sources
+- **Stooq.pl** (`--provider stooq`, the historical default): now requires a
+  captcha-issued API key for its CSV quote endpoint (`--stooq-apikey` /
+  `STOOQ_APIKEY`), and its bulk fund-listing page is a JavaScript app that can no
+  longer be scraped — so you must pass symbols with `--symbols-file`.
+- **analizy.pl** (`--provider analizy`, recommended): Polish open-end fund (TFI)
+  NAV history via a JSON API, no key required. See below.
 - **Update Frequency**: Daily (depends on fund)
 - **Historical Data**: Varies by fund (some have years, others months)
+
+#### Alternative provider: analizy.pl (Polish TFI funds)
+
+`providers.py` adds a pluggable data-source layer so the analyzer isn't tied to
+Stooq. It includes `AnalizyProvider`, which fetches Polish open-end fund (TFI)
+NAV history from the analizy.pl quotation API:
+
+```python
+from providers import AnalizyProvider
+
+provider = AnalizyProvider()                 # or prefer_dividend=True
+df = provider.download_quotes("ING35")       # -> Date/Open/High/Low/Close/Volume
+```
+
+Funds publish a single daily NAV, so OHLC columns all carry that NAV and Volume
+is 0. For distribution funds, `prefer_dividend=True` uses the dividend-adjusted
+series (total return) when available. The returned DataFrame matches the schema
+`FundAnalyzer` already consumes, so it's a drop-in source for metrics.
+
+> ⚠️ The analizy.pl endpoint is **undocumented** and may change without notice.
+> Review their terms of use before heavy or commercial scraping. This is an
+> additional option, not a guaranteed-stable API.
+
+**Switch providers from the CLI** with `--provider`:
+
+```bash
+# Use the analizy.pl TFI source instead of Stooq
+python analyze_polish_funds.py --provider analizy --portfolio my_holdings.json
+```
+
+Cache entries are namespaced per provider, so Stooq and analizy.pl results
+never collide.
+
+**Screening with analizy.pl.** analizy.pl has no bulk "list all funds" endpoint,
+so you supply the symbols to screen via `--symbols-file` (one symbol per line, or
+a JSON array). Each fund's real name is resolved from the verified quotation API:
+
+```bash
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt
+```
+
+See `sample_symbols_analizy.txt` for the format. (`--symbols-file` also works
+with Stooq to screen a specific subset instead of the full listing.)
+
+**Symbol mapping.** The two sources use different tickers for the same fund
+(Stooq `*.N` vs analizy.pl codes like `ING35`). `providers.SymbolMapper` lets
+you keep one watch/holdings file and resolve the right symbol per provider:
+
+```python
+from providers import SymbolMapper
+mapper = SymbolMapper.from_file("symbol_map.json")
+mapper.resolve("ING35", "stooq")     # reverse-maps to the Stooq ticker
+```
+
+`symbol_map.json` maps a canonical name to per-provider symbols:
+
+```json
+{ "GS Globalny": {"stooq": "1234.N", "analizy": "ING35"} }
+```
+
+Unmapped symbols pass through unchanged, so mapping is optional.
+
+**Building the map semi-automatically.** `build_map.py` proposes a
+`symbol_map.json` by matching fund *names* across providers (diacritic- and
+word-order-insensitive fuzzy matching):
+
+```bash
+python build_map.py --analizy-symbols sample_symbols_analizy.txt \
+    --output symbol_map.draft.json
+```
+
+It fetches each fund's name from both sides, pairs them by similarity, and
+writes a draft you review before renaming to `symbol_map.json`. Low-confidence
+matches are kept but flagged (and `--confident-only` writes just the strong
+two-provider matches). The matching core is deterministic and unit-tested; only
+the fetching step uses the network.
 
 ### Calculations
 - **Trading Days**: 252 per year assumed
