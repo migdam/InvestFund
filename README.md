@@ -1,6 +1,14 @@
 # Polish Investment Funds Analyzer
 
-A comprehensive Python tool for analyzing Polish investment funds listed on [Stooq.pl](https://stooq.pl). This enhanced version provides advanced financial metrics, risk analysis, and intelligent recommendations.
+A comprehensive Python tool for analyzing Polish investment funds. This enhanced version provides advanced financial metrics, risk analysis, and intelligent recommendations.
+
+> ⚠️ **Data-source status.** Stooq's free feed no longer works out of the box —
+> its fund-listing page is now a JavaScript app (nothing to scrape) and its CSV
+> quote endpoint requires a captcha-issued API key. **Use the `analizy.pl`
+> provider** (`--provider analizy --symbols-file …`), which needs no key, or
+> supply a Stooq key via `--stooq-apikey` / `STOOQ_APIKEY`. Run
+> `python doctor.py` (or `--self-test`) to check what's reachable on your
+> machine. See [Data Sources](#data-sources) for details.
 
 ## Features
 
@@ -85,43 +93,57 @@ the whole interface without any network access. Turn it off to use live data.
 
 ## Usage
 
+### Check your setup first
+
+```bash
+python doctor.py            # same as: python analyze_polish_funds.py --self-test
+```
+
+Verifies Python, dependencies, network, and each data source with a clear
+`[PASS]`/`[WARN]`/`[FAIL]` line — the fastest way to answer "will this work?".
+
 ### Basic Usage
 
-Analyze the first 50 funds (default):
+Analyze a set of funds via the `analizy.pl` provider (recommended — no API key):
 ```bash
-python analyze_polish_funds.py
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt
 ```
+
+`--symbols-file` lists the funds to screen, one symbol per line (see
+[Screening with analizy.pl](#alternative-provider-analizypl-polish-tfi-funds)).
+The examples below add the same two flags.
 
 ### Common Examples
 
-**Analyze all funds:**
+**Analyze every symbol in the file:**
 ```bash
-python analyze_polish_funds.py --max-funds 0
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --max-funds 0
 ```
 
 **Generate Excel and HTML reports:**
 ```bash
-python analyze_polish_funds.py --format excel html --output my_analysis
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --format excel html --output my_analysis
 ```
 
 **Create visualizations:**
 ```bash
-python analyze_polish_funds.py --plots
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --plots
 ```
 
 **Disable caching for fresh data:**
 ```bash
-python analyze_polish_funds.py --no-cache
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --no-cache
 ```
 
 **Use more parallel workers (faster):**
 ```bash
-python analyze_polish_funds.py --workers 20
+python analyze_polish_funds.py --provider analizy --symbols-file sample_symbols_analizy.txt --workers 20
 ```
 
-**Custom output filename:**
+**Use Stooq with an API key** (get one at <https://stooq.pl/q/d/?s=wig&get_apikey>):
 ```bash
-python analyze_polish_funds.py --output results/fund_report_2024
+python analyze_polish_funds.py --provider stooq --stooq-apikey YOURKEY --symbols-file your_stooq_symbols.txt
 ```
 
 ### Advanced Usage
@@ -166,6 +188,10 @@ python analyze_polish_funds.py --clear-cache
 | `--portfolio PATH` | Track a holdings file (JSON/CSV): value, P&L, allocation, fees | None |
 | `--project-years N` | Horizon for portfolio fee-drag projection | 10 |
 | `--assumed-return R` | Assumed gross annual return for fee projection | 0.06 |
+| `--provider NAME` | Data source: `stooq` or `analizy` | `stooq` |
+| `--symbols-file PATH` | File of fund symbols to screen (one per line or JSON list); required for `analizy` | None |
+| `--stooq-apikey KEY` | Stooq CSV API key (also via `STOOQ_APIKEY` env var) | None |
+| `--self-test` | Run environment & data-source health checks and exit (same as `doctor.py`) | False |
 
 ## Benchmark Comparison
 
@@ -385,6 +411,17 @@ python analyze_polish_funds.py --no-cache --max-funds 50
 - Enable caching (default)
 - Reduce fund count: `--max-funds 50`
 
+### Not sure what's broken?
+Run `python doctor.py` (or `python analyze_polish_funds.py --self-test`) — it
+checks dependencies, network, and each data source and prints a clear pass/fail.
+
+### Stooq: "fund listing ... JavaScript app" or "requires an API key"
+Stooq retired its free endpoints. Either use `--provider analizy` with a
+`--symbols-file`, or get a Stooq key (one-time captcha) at
+<https://stooq.pl/q/d/?s=wig&get_apikey> and pass it via `--stooq-apikey` /
+`STOOQ_APIKEY`. Stooq's bulk *listing* is unavailable either way, so supply
+symbols explicitly with `--symbols-file`.
+
 ### Network Errors
 - Check internet connection
 - Some funds may be temporarily unavailable (warnings will be shown)
@@ -407,7 +444,7 @@ python analyze_polish_funds.py --no-cache --max-funds 50
 
 3. **Past Performance**: Historical returns do not guarantee future results.
 
-4. **Data Accuracy**: Data is sourced from Stooq.pl. Verify important data independently.
+4. **Data Accuracy**: Data is sourced from third-party providers (Stooq.pl and analizy.pl). Verify important data independently.
 
 5. **Simplified Model**: The recommendation system uses simplified rules and may not account for:
    - Your personal financial situation
@@ -423,7 +460,12 @@ python analyze_polish_funds.py --no-cache --max-funds 50
 ## Technical Details
 
 ### Data Sources
-- **Default provider**: Stooq.pl
+- **Stooq.pl** (`--provider stooq`, the historical default): now requires a
+  captcha-issued API key for its CSV quote endpoint (`--stooq-apikey` /
+  `STOOQ_APIKEY`), and its bulk fund-listing page is a JavaScript app that can no
+  longer be scraped — so you must pass symbols with `--symbols-file`.
+- **analizy.pl** (`--provider analizy`, recommended): Polish open-end fund (TFI)
+  NAV history via a JSON API, no key required. See below.
 - **Update Frequency**: Daily (depends on fund)
 - **Historical Data**: Varies by fund (some have years, others months)
 
