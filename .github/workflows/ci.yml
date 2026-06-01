@@ -33,7 +33,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Byte-compile sources
-        run: python -m compileall -q analyze_polish_funds.py dashboard.py workflows
+        run: python -m compileall -q analyze_polish_funds.py dashboard.py providers.py build_map.py workflows
 
       - name: Unit tests (mock-based)
         run: python test_with_mocks.py
@@ -44,13 +44,14 @@ jobs:
       - name: Dashboard smoke tests
         run: python test_dashboard.py
 
-      - name: Module tests (rebalancing, alerts, metrics, workflow, providers)
+      - name: Module tests (rebalancing, alerts, metrics, workflow, providers, build-map)
         run: |
           python test_rebalancing.py
           python test_alerts.py
           python test_metrics_advanced.py
           python test_workflow.py
           python test_providers.py
+          python test_build_map.py
 
   lint:
     name: Lint

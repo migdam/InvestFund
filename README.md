@@ -489,6 +489,21 @@ mapper.resolve("ING35", "stooq")     # reverse-maps to the Stooq ticker
 
 Unmapped symbols pass through unchanged, so mapping is optional.
 
+**Building the map semi-automatically.** `build_map.py` proposes a
+`symbol_map.json` by matching fund *names* across providers (diacritic- and
+word-order-insensitive fuzzy matching):
+
+```bash
+python build_map.py --analizy-symbols sample_symbols_analizy.txt \
+    --output symbol_map.draft.json
+```
+
+It fetches each fund's name from both sides, pairs them by similarity, and
+writes a draft you review before renaming to `symbol_map.json`. Low-confidence
+matches are kept but flagged (and `--confident-only` writes just the strong
+two-provider matches). The matching core is deterministic and unit-tested; only
+the fetching step uses the network.
+
 ### Calculations
 - **Trading Days**: 252 per year assumed
 - **Risk-Free Rate**: 5% annual (configurable in code)
