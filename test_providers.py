@@ -184,6 +184,25 @@ def run() -> int:
     check("from_file resolves correctly",
           loaded.resolve("X", "analizy") == "QQ1")
 
+    # 11. parse_label reads the fund name from a payload
+    check("parse_label reads label",
+          AnalizyProvider.parse_label(REAL_SHAPE_PAYLOAD)
+          == "Goldman Sachs Globalny Spółek Dywidendowych")
+    check("parse_label handles missing label",
+          AnalizyProvider.parse_label({}) == "")
+
+    # 12. get_fund_list resolves names via the (stubbed) quotation endpoint
+    prov = AnalizyProvider()
+    # Stub network so the test stays offline
+    prov._fetch_json = lambda sym: (
+        REAL_SHAPE_PAYLOAD if sym == "ING35" else None
+    )
+    funds = prov.get_fund_list(["ING35", "MISSING"])
+    check("get_fund_list skips unresolved symbols", len(funds) == 1)
+    check("get_fund_list uses real name",
+          funds[0].symbol == "ING35"
+          and funds[0].name == "Goldman Sachs Globalny Spółek Dywidendowych")
+
     print()
     if failures:
         print(f"PROVIDER TESTS: {failures} failed")

@@ -459,6 +459,18 @@ python analyze_polish_funds.py --provider analizy --portfolio my_holdings.json
 Cache entries are namespaced per provider, so Stooq and analizy.pl results
 never collide.
 
+**Screening with analizy.pl.** analizy.pl has no bulk "list all funds" endpoint,
+so you supply the symbols to screen via `--symbols-file` (one symbol per line, or
+a JSON array). Each fund's real name is resolved from the verified quotation API:
+
+```bash
+python analyze_polish_funds.py --provider analizy \
+    --symbols-file sample_symbols_analizy.txt
+```
+
+See `sample_symbols_analizy.txt` for the format. (`--symbols-file` also works
+with Stooq to screen a specific subset instead of the full listing.)
+
 **Symbol mapping.** The two sources use different tickers for the same fund
 (Stooq `*.N` vs analizy.pl codes like `ING35`). `providers.SymbolMapper` lets
 you keep one watch/holdings file and resolve the right symbol per provider:

@@ -1722,7 +1722,34 @@ Examples:
              "(analizy.pl TFI NAV API; uses analizy.pl symbols like ING35)"
     )
 
+    parser.add_argument(
+        "--symbols-file",
+        type=str,
+        default=None,
+        help="Path to a file of fund symbols to screen (one per line, or a JSON "
+             "list). Required for --provider analizy (no bulk list endpoint)."
+    )
+
     return parser
+
+
+def load_symbols_file(path: str) -> list:
+    """
+    Load fund symbols from a file: either a JSON array, or plain text with one
+    symbol per line (``#`` comments and blank lines ignored).
+    """
+    text = Path(path).read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text[0] == "[":
+        data = json.loads(text)
+        return [str(s).strip() for s in data if str(s).strip()]
+    symbols = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            symbols.append(line)
+    return symbols
 
 
 def build_quote_source(provider: str):
@@ -1786,9 +1813,24 @@ def main():
             print(f"Benchmark '{args.benchmark}' loaded; computing relative metrics.",
                   file=sys.stderr)
 
-    # Get fund list
-    print("Downloading list of funds…", file=sys.stderr)
-    funds = analyzer.get_fund_list()
+    # Get fund list. analizy.pl has no bulk list endpoint, so it requires an
+    # explicit --symbols-file; Stooq uses its built-in listing page.
+    if args.symbols_file:
+        symbols = load_symbols_file(args.symbols_file)
+        print(f"Loaded {len(symbols)} symbols from {args.symbols_file}", file=sys.stderr)
+        if args.provider == "analizy":
+            from providers import AnalizyProvider
+            funds = AnalizyProvider().get_fund_list(symbols)
+        else:
+            funds = [FundInfo(symbol=s, name=s) for s in symbols]
+    elif args.provider == "analizy":
+        print("Error: --provider analizy requires --symbols-file (no bulk list "
+              "endpoint exists). Provide a text/JSON file of analizy.pl symbols.",
+              file=sys.stderr)
+        return
+    else:
+        print("Downloading list of funds…", file=sys.stderr)
+        funds = analyzer.get_fund_list()
     print(f"Found {len(funds)} funds.", file=sys.stderr)
 
     # Limit funds if requested

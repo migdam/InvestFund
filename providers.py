@@ -49,7 +49,7 @@ import pandas as pd
 import requests
 
 # Reuse the project's constants/headers where helpful
-from analyze_polish_funds import FundAnalyzer
+from analyze_polish_funds import FundAnalyzer, FundInfo
 
 _DEFAULT_HEADERS = {
     "User-Agent": (
@@ -195,6 +195,41 @@ class AnalizyProvider(DataProvider):
         if payload is None:
             return None
         return self.parse_payload(payload, prefer_dividend=self.prefer_dividend)
+
+    @staticmethod
+    def parse_label(payload: dict) -> str:
+        """Extract the human-readable fund name from a quotation payload."""
+        if isinstance(payload, dict):
+            return str(payload.get("label") or "")
+        return ""
+
+    def get_fund_list(self, symbols) -> "list[FundInfo]":
+        """
+        Build a fund list for an explicit set of analizy.pl symbols.
+
+        analizy.pl has no verified bulk "list all funds" endpoint, so discovery
+        is driven by a caller-supplied symbol list: each symbol is fetched via
+        the verified quotation endpoint and its real name (``label``) is read
+        from the payload. Symbols that fail to fetch are skipped with a warning.
+
+        Parameters
+        ----------
+        symbols : Iterable[str]
+            analizy.pl fund symbols (e.g. ``["ING35", ...]``).
+
+        Returns
+        -------
+        list[FundInfo]
+            One entry per resolvable symbol, with the real fund name.
+        """
+        funds = []
+        for symbol in symbols:
+            payload = self._fetch_json(symbol)
+            if payload is None:
+                continue
+            name = self.parse_label(payload) or symbol
+            funds.append(FundInfo(symbol=symbol, name=name))
+        return funds
 
 
 class SymbolMapper:

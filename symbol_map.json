@@ -1,0 +1,6 @@
+{
+  "_comment": "Maps a canonical fund name to per-provider symbols. Used by providers.SymbolMapper to translate tickers between Stooq (*.N) and analizy.pl (e.g. ING35). Only the analizy.pl symbol below is verified; add your own entries as you confirm each fund's symbol on both sites. Unmapped symbols pass through unchanged.",
+  "Goldman Sachs Globalny Spolek Dywidendowych": {
+    "analizy": "ING35"
+  }
+}
