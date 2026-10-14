@@ -262,7 +262,7 @@ def _git_commit() -> str:
     try:
         out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT,
                              capture_output=True, text=True, check=True)
-        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=REPO_ROOT,
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPO_ROOT,
                                capture_output=True, text=True).stdout.strip()
         return out.stdout.strip() + ("+dirty" if dirty else "")
     except Exception:
@@ -302,16 +302,30 @@ def compare(before: dict, after: dict) -> int:
             regressed.append(metric)
         print(f"{metric:<22}{_fmt(metric, b):>22}{_fmt(metric, a):>22}{change:>10}  {verdict}")
 
+    # Best-of microbenchmarks still drift ~10% between runs with machine state,
+    # so a decision that rests only on them must be re-measured (CONFIRM)
+    # rather than trusted from a single before/after pair.
+    def micro_only(metrics):
+        return all(m in BEST_OF_METRICS for m in metrics)
+
     if not after.get("golden_ok"):
         decision = "REVERT (golden outputs changed)"
-    elif regressed:
+    elif regressed and not micro_only(regressed):
         decision = f"REVERT (regressed: {', '.join(regressed)})"
+    elif regressed:
+        decision = (f"CONFIRM (only noisy microbenchmarks regressed: {', '.join(regressed)}; "
+                    "re-measure before and after once, then follow the new verdict)")
     elif not improved:
         decision = "REVERT (no significant improvement)"
+    elif micro_only(improved):
+        decision = (f"CONFIRM (only noisy microbenchmarks improved: {', '.join(improved)}; "
+                    "re-measure before and after once, then follow the new verdict)")
     else:
         decision = f"KEEP (improved: {', '.join(improved)})"
     print(f"\nVERDICT: {decision}")
-    return 0 if decision.startswith("KEEP") else 1
+    if decision.startswith("KEEP"):
+        return 0
+    return 3 if decision.startswith("CONFIRM") else 1
 
 
 def main() -> int:
