@@ -12,7 +12,8 @@ e2e_cold_*            full CLI run (--provider analizy --symbols-file ...) with
                       an empty cache: wall time, CPU time, peak RSS, requests,
                       and new connections seen by the mock server
 e2e_warm_*            the same run again, reusing the cache from the cold run
-requests_maxfunds5    requests made by a cold run with --max-funds 5
+requests_maxfunds5    requests made by a cold run with --max-funds 5 (its output
+                      is checked against bench/golden_maxfunds5.json)
 parse_ms_per_fund     in-process JSON decode + AnalizyProvider.parse_payload
 compute_ms_per_fund   in-process FundAnalyzer.analyze_fund on parsed data
 
@@ -49,6 +50,10 @@ from pathlib import Path
 BENCH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BENCH_DIR.parent
 GOLDEN_PATH = BENCH_DIR / "golden.json"
+GOLDEN_MAXFUNDS_PATH = BENCH_DIR / "golden_maxfunds5.json"
+# --max-funds N analyzes the first N symbols that resolve, in file order. A 404
+# and a too-short fund sit among the first five to pin those semantics down.
+MAXFUNDS_EARLY = ["BENCH00", "MISSING01", "SHORT15"]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(BENCH_DIR))
 
@@ -87,6 +92,8 @@ def _records_by_symbol(df) -> dict:
 def compare_to_golden(df, golden: list) -> list:
     """Return human-readable mismatches between a summary frame and golden."""
     problems = []
+    if golden and list(df.columns) != list(golden[0]):
+        problems.append(f"column order differs: got {list(df.columns)}, golden {list(golden[0])}")
     current = _records_by_symbol(df)
     expected = {r["symbol"]: r for r in golden}
     if set(current) != set(expected):
@@ -223,7 +230,11 @@ def _check_csv(run: dict, golden: list, label: str) -> list:
     if run["exit_code"] != 0 or not run["csv"].exists():
         tail = run["log"].read_text()[-1500:] if run["log"].exists() else ""
         return [f"{label}: CLI failed (exit {run['exit_code']}). stderr tail:\n{tail}"]
-    return [f"{label}: {p}" for p in compare_to_golden(pd.read_csv(run["csv"]), golden)]
+    df = pd.read_csv(run["csv"])
+    found = compare_to_golden(df, golden)
+    if "score" in df.columns and not df["score"].is_monotonic_decreasing:
+        found.append("rows are not sorted by score, highest first")
+    return [f"{label}: {p}" for p in found]
 
 
 # ---------------------------------------------------------------------------
@@ -359,12 +370,41 @@ def main() -> int:
         tmp = Path(tmp)
         symbols_file = tmp / "symbols.txt"
         symbols_file.write_text("\n".join(mock_analizy.symbols()) + "\n")
+        maxfunds_file = tmp / "symbols_maxfunds.txt"
+        maxfunds_file.write_text("\n".join(
+            MAXFUNDS_EARLY + [s for s in mock_analizy.symbols() if s not in MAXFUNDS_EARLY]
+        ) + "\n")
+        maxfunds_args = ["--max-funds", "5"]
 
         with mock_analizy.MockAnalizyServer() as server:
+            if args.update_golden:
+                import pandas as pd
+                workdir = tmp / "golden_maxfunds"
+                workdir.mkdir()
+                run = run_cli(server, workdir, maxfunds_file, maxfunds_args)
+                if run["exit_code"] != 0 or not run["csv"].exists():
+                    print(run["log"].read_text()[-1500:], file=sys.stderr)
+                    return 2
+                records = sorted(
+                    json.loads(pd.read_csv(run["csv"]).to_json(orient="records", double_precision=15)),
+                    key=lambda r: r["symbol"],
+                )
+                GOLDEN_MAXFUNDS_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=1) + "\n")
+                print(f"Wrote {len(records)} golden records to {GOLDEN_MAXFUNDS_PATH}")
+            if not GOLDEN_MAXFUNDS_PATH.exists():
+                print("bench/golden_maxfunds5.json is missing; run with --update-golden first.",
+                      file=sys.stderr)
+                return 2
+            golden_maxfunds = json.loads(GOLDEN_MAXFUNDS_PATH.read_text())
+
             if args.golden_only or args.update_golden:
                 workdir = tmp / "golden_run"
                 workdir.mkdir()
                 problems += _check_csv(run_cli(server, workdir, symbols_file), golden, "cli")
+                workdir = tmp / "golden_maxfunds_check"
+                workdir.mkdir()
+                problems += _check_csv(run_cli(server, workdir, maxfunds_file, maxfunds_args),
+                                       golden_maxfunds, "cli --max-funds 5")
                 for p in problems[:20]:
                     print(f"GOLDEN MISMATCH {p}")
                 print("golden: PASS" if not problems else f"golden: FAIL ({len(problems)} mismatches)")
@@ -385,7 +425,8 @@ def main() -> int:
 
             maxfunds_dir = tmp / "maxfunds"
             maxfunds_dir.mkdir()
-            maxfunds = run_cli(server, maxfunds_dir, symbols_file, ["--max-funds", "5"])
+            maxfunds = run_cli(server, maxfunds_dir, maxfunds_file, maxfunds_args)
+            problems += _check_csv(maxfunds, golden_maxfunds, "cli --max-funds 5")
 
         metrics.update({
             "e2e_cold_s": _summary([r["wall_s"] for r in cold]),
