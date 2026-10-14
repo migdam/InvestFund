@@ -63,7 +63,12 @@ TIME_METRICS = [
 COUNT_METRICS = [
     "requests_cold", "connections_cold", "requests_warm", "requests_maxfunds5",
 ]
-MIN_SIGNIFICANT_CHANGE = 0.05  # 5%, or twice the observed noise if larger
+# Cheap, repeatable scenarios are compared on their fastest run (noise only
+# adds time, so best-of-N is stable while medians drift with machine load);
+# the end-to-end runs are compared on their median.
+BEST_OF_METRICS = {"cli_startup_s", "parse_ms_per_fund", "compute_ms_per_fund"}
+# A timing change counts only beyond this floor (or twice the noise if larger).
+MIN_SIGNIFICANT_CHANGE = {"best_of": 0.15, "median": 0.05}
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +143,7 @@ def time_parse_and_compute(payloads: dict, repeats: int) -> dict:
     parse_runs, compute_runs = [], []
     # One untimed warm-up pass, then enough passes for a robust median: these
     # scenarios are cheap and noisy, unlike the end-to-end runs.
-    for i in range(1 + max(repeats, 7)):
+    for i in range(1 + max(repeats, 9)):
         t0 = time.perf_counter()
         parsed = {s: AnalizyProvider.parse_payload(json.loads(b)) for s, b in payloads.items()}
         parse_ms = (time.perf_counter() - t0) * 1000 / n
@@ -154,8 +159,8 @@ def time_parse_and_compute(payloads: dict, repeats: int) -> dict:
             parse_runs.append(parse_ms)
             compute_runs.append(compute_ms)
     return {
-        "parse_ms_per_fund": _summary(parse_runs),
-        "compute_ms_per_fund": _summary(compute_runs),
+        "parse_ms_per_fund": _summary(parse_runs, best_of=True),
+        "compute_ms_per_fund": _summary(compute_runs, best_of=True),
     }
 
 
@@ -180,7 +185,7 @@ def time_cli_startup(repeats: int) -> dict:
             cwd=REPO_ROOT, env=_env(), capture_output=True, check=True, timeout=120,
         )
         runs.append(time.perf_counter() - t0)
-    return _summary(runs)
+    return _summary(runs, best_of=True)
 
 
 def run_cli(server, workdir: Path, symbols_file: Path, extra_args=()) -> dict:
@@ -225,17 +230,30 @@ def _check_csv(run: dict, golden: list, label: str) -> list:
 # Reporting
 # ---------------------------------------------------------------------------
 
-def _summary(runs: list) -> dict:
-    """Median plus a relative spread: IQR when there are enough runs, else range."""
+def _summary(runs: list, best_of: bool = False) -> dict:
+    """
+    Headline value plus a relative noise estimate.
+
+    best_of: value is the fastest run; noise is the gap to the second fastest
+    (a loose lower envelope means the minimum itself is unreliable).
+    Otherwise: value is the median; noise is the IQR (>= 5 runs) or the range.
+    """
+    ordered = sorted(runs)
     med = statistics.median(runs)
-    if len(runs) >= 5:
-        q1, _, q3 = statistics.quantiles(runs, n=4)
-        spread = q3 - q1
+    if best_of:
+        value = ordered[0]
+        spread = ordered[1] - ordered[0] if len(ordered) > 1 else 0.0
     else:
-        spread = max(runs) - min(runs)
+        value = med
+        if len(runs) >= 5:
+            q1, _, q3 = statistics.quantiles(runs, n=4)
+            spread = q3 - q1
+        else:
+            spread = ordered[-1] - ordered[0]
     return {
-        "median": med, "min": min(runs), "max": max(runs),
-        "noise": spread / med if med else 0.0,
+        "value": value, "stat": "best_of" if best_of else "median",
+        "median": med, "min": ordered[0], "max": ordered[-1],
+        "noise": spread / value if value else 0.0,
         "runs": runs,
     }
 
@@ -253,14 +271,15 @@ def _git_commit() -> str:
 
 def _fmt(metric: str, value) -> str:
     if isinstance(value, dict):
-        return f"{value['median']:.3f} (±{value['noise'] * 100:.0f}%)"
+        tag = "best" if value.get("stat") == "best_of" else "med"
+        return f"{value['value']:.3f} {tag} ±{value['noise'] * 100:.0f}%"
     return str(value)
 
 
 def compare(before: dict, after: dict) -> int:
     """Print per-metric deltas and an overall KEEP/REVERT verdict."""
     improved, regressed = [], []
-    print(f"\n{'metric':<22}{'before':>20}{'after':>20}{'change':>10}  verdict")
+    print(f"\n{'metric':<22}{'before':>22}{'after':>22}{'change':>10}  verdict")
     for metric in TIME_METRICS + COUNT_METRICS:
         b, a = before["metrics"].get(metric), after["metrics"].get(metric)
         if b is None or a is None:
@@ -270,9 +289,10 @@ def compare(before: dict, after: dict) -> int:
             change = f"{delta:+d}"
             verdict = "better" if delta < 0 else "WORSE" if delta > 0 else "same"
         else:
-            bm, am = b["median"], a["median"]
+            bm, am = b["value"], a["value"]
             rel = (am - bm) / bm if bm else 0.0
-            threshold = max(MIN_SIGNIFICANT_CHANGE, 2 * max(a["noise"], b["noise"]))
+            floor = MIN_SIGNIFICANT_CHANGE[a.get("stat", "median")]
+            threshold = max(floor, 2 * max(a["noise"], b["noise"]))
             change = f"{rel * 100:+.1f}%"
             verdict = ("better" if rel <= -threshold
                        else "WORSE" if rel >= threshold else "noise")
@@ -280,7 +300,7 @@ def compare(before: dict, after: dict) -> int:
             improved.append(metric)
         elif verdict == "WORSE":
             regressed.append(metric)
-        print(f"{metric:<22}{_fmt(metric, b):>20}{_fmt(metric, a):>20}{change:>10}  {verdict}")
+        print(f"{metric:<22}{_fmt(metric, b):>22}{_fmt(metric, a):>22}{change:>10}  {verdict}")
 
     if not after.get("golden_ok"):
         decision = "REVERT (golden outputs changed)"
@@ -297,7 +317,7 @@ def compare(before: dict, after: dict) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--startup-repeats", type=int, default=5)
+    parser.add_argument("--startup-repeats", type=int, default=7)
     parser.add_argument("--out", type=Path, help="write results JSON here")
     parser.add_argument("--compare", type=Path, help="earlier results JSON to compare against")
     parser.add_argument("--golden-only", action="store_true",
@@ -382,7 +402,7 @@ def main() -> int:
 
     print(f"\nCommit {result['meta']['commit']} · {result['meta']['machine']}")
     for metric in TIME_METRICS + COUNT_METRICS:
-        print(f"  {metric:<22}{_fmt(metric, metrics[metric]):>20}")
+        print(f"  {metric:<22}{_fmt(metric, metrics[metric]):>22}")
     print("  golden outputs        " + ("PASS" if not problems else f"FAIL ({len(problems)})"))
     for p in problems[:10]:
         print(f"    {p}")
