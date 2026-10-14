@@ -54,6 +54,10 @@ results_*.html
 !scoring_configs/*.json
 !sample_portfolio.json
 !symbol_map.json
+!bench/*.json
+
+# Scratch results from bench/bench.py runs
+bench/.runs/
 !requirements.txt
 
 # Plots directory

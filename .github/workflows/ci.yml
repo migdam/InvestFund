@@ -53,6 +53,9 @@ jobs:
           python test_providers.py
           python test_build_map.py
 
+      - name: Golden-output check (offline mock of analizy.pl)
+        run: python bench/bench.py --golden-only
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
