@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 8
+- **Iterations logged:** 9
 
 ## Summary
 
@@ -40,21 +40,14 @@ Ordered by expected gain. Each item: evidence, idea, trap. After iteration 6 a
 cold run takes about 2.1 s: ~0.5 s startup (pandas, numpy, requests — all
 needed), ~0.2 s network in the mock, then parsing and metrics.
 
-1. **Parsing runs inside the 10 download threads.** `fetch_funds` parses
-   each payload in the worker that fetched it, so up to 10 threads run
-   CPU-bound pandas code at once; iteration 8 showed that costs about 2.7×
-   for the analysis step. Idea: keep the requests in threads but parse
-   outside them (or with less contention), keeping the overlap with network
-   waits. Trap: the mock's network phase is short (~0.25 s), so measure the
-   split first; names, order and `--max-funds` semantics must not change.
-2. **Daily returns recomputed about six times per fund**: 225 `pct_change`
+1. **Daily returns recomputed about six times per fund**: 225 `pct_change`
    calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown.
    `compute_ms_per_fund` is now ≈3.9 ms (≈0.15 s per run, ~7%). Idea: compute
    returns once per fund and pass them in. Trap: results must stay within the
    golden tolerance (1e-9 relative), so keep the same pandas operations, just
    do them once. Expect the same outcome as iteration 7 (a microbenchmark win
    too small to confirm end to end) unless the noise is low.
-3. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
+2. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
    get the name, then `download_quotes` loads it again for the analysis
    (39 extra loads per warm run). Not measured yet; likely small.
 
@@ -300,3 +293,28 @@ Verdict: KEEP (improved: e2e_cold_s, e2e_cold_cpu_s, e2e_warm_s)
 | `e2e_warm_s` | 1.31 s | 0.96 s | −27.0% |
 
 Golden outputs: PASS (both). Commit: `perf: analyze prefetched analizy funds in one worker`
+
+### Iteration 9 — 2026-10-15 — KEPT
+Hypothesis: `fetch_funds` parsed each payload inside its download thread, so up
+to 10 threads ran CPU-bound pandas code at once. Measured first, with the mock
+server in its own process (in-process it shares the GIL and skews results):
+fetch phase for 40 symbols ~840 ms wall / ~810 ms CPU today; parsing in the
+main thread as responses arrive ~540 ms / ~455 ms, whether the JSON decode
+stays in the workers or not. Keeping the decode in the workers keeps the
+`_fetch_json` seam the provider tests stub. Expected −0.25–0.3 s on cold runs
+(~15%), lower CPU, little change on warm runs (mostly cache), identical
+outputs.
+Change: `fetch_funds` submits `_fetch_json` downloads to the pool and parses
+each response on the calling thread via `as_completed`; cache lookups also
+moved to the calling thread (`providers.py`). New check: parsing runs on the
+calling thread (moving it back into the workers fails it). Suites pass on
+Python 3.10/3.11/3.12 stacks.
+Verdict: KEEP (improved: e2e_cold_s, e2e_cold_cpu_s, e2e_cold_rss_mb)
+
+| metric | before | after | change |
+|---|---|---|---|
+| `e2e_cold_s` | 1.88 s | 1.48 s | −21.4% |
+| `e2e_cold_cpu_s` | 1.94 s | 1.57 s | −19.4% |
+| `e2e_cold_rss_mb` | 158 MB | 148 MB | −6.5% |
+
+Golden outputs: PASS (both). Commit: `perf: parse analizy responses outside the download threads`

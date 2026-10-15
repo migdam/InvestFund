@@ -249,6 +249,25 @@ def run() -> int:
     check("fetched quotes record the fund name",
           quotes["ING35"].attrs.get("name") == "Goldman Sachs Globalny Spółek Dywidendowych")
 
+    # Parsing is CPU-bound: it must run on the calling thread, not in the
+    # download workers, where threads would only contend for the GIL.
+    original_parse = AnalizyProvider.__dict__["parse_payload"]
+    parse_threads = []
+
+    def recording_parse(cls, payload, prefer_dividend=False):
+        parse_threads.append(threading.current_thread())
+        return original_parse.__func__(cls, payload, prefer_dividend=prefer_dividend)
+
+    AnalizyProvider.parse_payload = classmethod(recording_parse)
+    try:
+        prov.fetch_funds(["DIV", "MISSING", "ING35", "EMPTY"], max_workers=2)
+    finally:
+        AnalizyProvider.parse_payload = original_parse
+    check("fetch_funds parses on the calling thread",
+          len(parse_threads) == 3
+          and all(t is threading.current_thread() for t in parse_threads),
+          f"threads={[t.name for t in parse_threads]}")
+
     # 14. fetch_funds with a cache: named entries are served without a request,
     #     unnamed (older) entries are fetched, and names survive the disk cache.
     import tempfile

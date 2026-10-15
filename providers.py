@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -250,7 +250,8 @@ class AnalizyProvider(DataProvider):
         if its fetch succeeds, named by the payload's ``label``, in input
         order), but requests run in parallel, at most ``max_workers`` at a
         time, and the quotes parsed from those same responses are returned so
-        the funds can be analyzed without downloading them again.
+        the funds can be analyzed without downloading them again. Responses
+        are parsed in the calling thread as they arrive.
 
         Parameters
         ----------
@@ -270,13 +271,7 @@ class AnalizyProvider(DataProvider):
             The listed funds, and quotes keyed by symbol (``None`` when a
             payload holds no usable prices).
         """
-        def fetch(symbol):
-            hit = cached(symbol) if cached is not None else None
-            if hit is not None and hit.attrs.get("name"):
-                return hit.attrs["name"], hit
-            payload = self._fetch_json(symbol)
-            if payload is None:
-                return None
+        def resolve(symbol, payload):
             name = self.parse_label(payload) or symbol
             df = self.parse_payload(payload, prefer_dividend=self.prefer_dividend)
             if df is not None:
@@ -296,7 +291,23 @@ class AnalizyProvider(DataProvider):
                     break
                 need = (limit - resolved) if limit else len(symbols)
                 batch = symbols[len(fetched):len(fetched) + need]
-                fetched.extend(pool.map(fetch, batch))
+                results = [None] * len(batch)
+                pending = {}
+                for i, symbol in enumerate(batch):
+                    hit = cached(symbol) if cached is not None else None
+                    if hit is not None and hit.attrs.get("name"):
+                        results[i] = (hit.attrs["name"], hit)
+                    else:
+                        pending[pool.submit(self._fetch_json, symbol)] = i
+                # Workers only download (and decode JSON). Parsing is CPU-bound
+                # pandas work that threads would only contend over (the GIL),
+                # so it runs here, on each response as it arrives.
+                for future in as_completed(pending):
+                    i = pending[future]
+                    payload = future.result()
+                    if payload is not None:
+                        results[i] = resolve(batch[i], payload)
+                fetched.extend(results)
 
         funds, quotes = [], {}
         for symbol, result in zip(symbols, fetched):
