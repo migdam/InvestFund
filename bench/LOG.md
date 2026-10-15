@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 6
+- **Iterations logged:** 7
 
 ## Summary
 
@@ -40,21 +40,14 @@ Ordered by expected gain. Each item: evidence, idea, trap. After iteration 6 a
 cold run takes about 2.1 s: ~0.5 s startup (pandas, numpy, requests — all
 needed), ~0.2 s network in the mock, then parsing and metrics.
 
-1. **Parsing is now the largest CPU cost** (`parse_ms_per_fund` ≈ 7.4 ms, ≈0.29 s
-   per 39-fund run, ~14% of a cold run). It includes the JSON decode (done by
-   `requests`) and `parse_payload`, which builds a list of tuples, then a
-   DataFrame, then lets `pd.to_datetime` infer the date format. Ideas: build
-   the columns directly; give `pd.to_datetime` an explicit format. Trap:
-   malformed dates must still become NaT and be dropped exactly as now; check
-   which share of the time is JSON decoding before optimizing the rest (a
-   faster JSON library would be a new dependency — Needs approval).
-2. **Daily returns recomputed about six times per fund**: 225 `pct_change`
+1. **Daily returns recomputed about six times per fund**: 225 `pct_change`
    calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown.
    `compute_ms_per_fund` is now ≈3.9 ms (≈0.15 s per run, ~7%). Idea: compute
    returns once per fund and pass them in. Trap: results must stay within the
    golden tolerance (1e-9 relative), so keep the same pandas operations, just
-   do them once.
-3. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
+   do them once. Expect the same outcome as iteration 7 (a microbenchmark win
+   too small to confirm end to end) unless the noise is low.
+2. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
    get the name, then `download_quotes` loads it again for the analysis
    (39 extra loads per warm run). Not measured yet; likely small.
 
@@ -69,12 +62,23 @@ Do not implement; the user decides.
 - Making `--max-funds` count only funds with enough history: changes which
   funds are analyzed.
 - Lower chart resolution (`dpi=300` today): changes output files.
+- **More end-to-end repeats in the benchmark.** On this shared machine the
+  end-to-end runs now spread ±10–22%, wider than the remaining wins (iteration
+  7 measured −17% CPU and −17% cold run and could not confirm either). Raising
+  `--repeats` for the end-to-end scenarios (e.g. 3 → 7) would resolve smaller
+  gains at about twice the time per iteration. The benchmark is frozen for the
+  loop, so this is your call.
 - Stooq path, out of scope here: `download_quotes` retries immediately (no
   backoff) even on HTTP 4xx, sending requests that cannot succeed.
 
 ## Tried and rejected
 
-*None yet.*
+- **Iteration 7 — leaner `parse_payload`** (one mask, one DataFrame
+  constructor, sort only when dates are not strictly increasing). Real CPU win:
+  `parse_ms_per_fund` −38% in both measurements, frames identical to the
+  original on pandas 2.3 and 3.0. Reverted because the gain never showed up
+  beyond the noise end to end (two CONFIRM verdicts). Worth retrying only if
+  the benchmark resolves it (see *Needs approval*).
 
 ## Iterations
 
@@ -242,3 +246,26 @@ stacks; the `d**3` mutation fails it on all three.
 Lesson for later iterations: before pushing a change that depends on library
 behavior, run the suites on CI's newest stack too (`uv venv --python 3.12`).
 Commit: `test: compare NumPy statistics with frozen scipy 1.17 values`
+
+### Iteration 7 — 2026-10-15 — REVERTED
+Hypothesis: `parse_payload` spent ~3 ms per fund copying the DataFrame through
+dropna (0.49 ms), adding four columns (1.02), reordering (0.69) and sorting
+(0.25). Masking once and building the final frame in a single constructor
+call, sorting only when dates are not strictly increasing, should cut
+`parse_ms_per_fund` by ~35% with identical frames; ~0.1 s end to end, possibly
+within noise. (JSON decoding is 0.9 of the 6.5 ms; date-format inference only
+0.2 ms, so neither was the target.)
+Change (reverted): new tail of `parse_payload` in `providers.py`, plus a test
+comparing it with a frozen copy of the original on awkward inputs (bad and
+missing values, string numbers, integers, unsorted, duplicate and mixed-format
+dates); identical frames on Python 3.10/3.11/3.12 stacks, and skipping the sort
+fallback failed it (checked).
+Verdict: CONFIRM, then CONFIRM again after re-measuring, which counts as REVERT.
+
+| metric | 1st run | 2nd run |
+|---|---|---|
+| `parse_ms_per_fund` | 6.51 → 4.01 ms (−38.4%, better) | 7.09 → 4.39 ms (−38.0%, better) |
+| `e2e_cold_s` | −4.5% (noise, ±22%) | −17.3% (noise, ±15%) |
+| `e2e_cold_cpu_s` | −8.7% (noise, ±16%) | −17.7% (noise, ±10%) |
+
+Golden outputs: PASS throughout. Reverted with `git reset --hard`.
