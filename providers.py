@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -230,6 +231,42 @@ class AnalizyProvider(DataProvider):
             name = self.parse_label(payload) or symbol
             funds.append(FundInfo(symbol=symbol, name=name))
         return funds
+
+    def fetch_funds(self, symbols, max_workers: int = 10):
+        """
+        Fetch each symbol once; return the fund list and the parsed quotes.
+
+        Same listing rules as :meth:`get_fund_list` (a symbol is listed only
+        if its fetch succeeds, named by the payload's ``label``, in input
+        order), but requests run in parallel, at most ``max_workers`` at a
+        time, and the quotes parsed from those same responses are returned so
+        the funds can be analyzed without downloading them again.
+
+        Returns
+        -------
+        (list[FundInfo], dict[str, Optional[pd.DataFrame]])
+            The listed funds, and quotes keyed by symbol (``None`` when a
+            payload holds no usable prices).
+        """
+        def fetch(symbol):
+            payload = self._fetch_json(symbol)
+            if payload is None:
+                return None
+            name = self.parse_label(payload) or symbol
+            return name, self.parse_payload(payload, prefer_dividend=self.prefer_dividend)
+
+        symbols = list(symbols)
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+            fetched = list(pool.map(fetch, symbols))
+
+        funds, quotes = [], {}
+        for symbol, result in zip(symbols, fetched):
+            if result is None:
+                continue
+            name, df = result
+            funds.append(FundInfo(symbol=symbol, name=name))
+            quotes[symbol] = df
+        return funds, quotes
 
 
 class SymbolMapper:

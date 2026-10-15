@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 0
+- **Iterations logged:** 1
 
 ## Summary
 
@@ -38,41 +38,36 @@ analizy.pl costs will differ, but the direction of each change carries over.
 
 Ordered by expected gain. Each item: evidence, idea, trap.
 
-1. **Every fund is downloaded twice, the first time one by one.**
-   `main()` calls `AnalizyProvider().get_fund_list()`, which fetches each
-   symbol sequentially only to read its name (`label`); `analyze_funds()` then
-   fetches each symbol again. Evidence: `requests_cold` 79 for 39 funds; the
-   sequential pass is about 4 s of the 8.7 s cold run (40 × 100 ms in the
-   mock). Idea: take the name from the same payload that supplies the quotes,
-   so each fund costs one request inside the existing worker pool. Trap: names,
-   and symbols that fail (404) or are too short, must come out exactly as
-   before — both goldens check this.
-2. **Warm runs still use the network** (`requests_warm` 40): name discovery
-   bypasses the cache. Likely solved by item 1 if the name is cached together
-   with the quotes.
-3. **`--max-funds` is applied after discovery** (`requests_maxfunds5` 45 for
-   5 funds). Stop fetching once enough funds are found. Trap: the option means
-   "the first N symbols that resolve, in file order"; a too-short fund still
-   counts toward N and is then skipped. Slicing the raw symbol list first fails
-   `golden_maxfunds5.json` (verified). Preserving the semantics means fetching
-   in order until N symbols have resolved.
-4. **No connection reuse** (`connections_cold` 79). Each `requests.get` opens a
+1. **Warm runs still use the network** (`requests_warm` 40, warm run 3.55 s
+   after iteration 1). `fetch_funds` always downloads every symbol to learn
+   its name, even when the analyzer's cache already holds its quotes; the cache
+   stores only the DataFrame, not the name. Idea: cache the name together with
+   the quotes and let the fetch step serve cached symbols without a request.
+   Trap: names must come out exactly as before, and a symbol that is cached
+   must still count as "resolved" for `--max-funds`.
+2. **`--max-funds` still fetches every symbol** (`requests_maxfunds5` 40 for
+   5 funds). Fetch in file order only until N symbols have resolved (batches
+   of at most `--workers`). Trap: the option means "the first N symbols that
+   resolve, in file order"; a too-short fund still counts toward N and is then
+   skipped. Slicing the raw symbol list first fails `golden_maxfunds5.json`
+   (verified).
+3. **No connection reuse** (`connections_cold` 40, one per request). Each `requests.get` opens a
    new connection. Idea: reuse connections via `requests.Session`; one session
    per worker thread (`threading.local`) is the safe pattern, as `Session` is
    not documented as thread-safe. Keep concurrency at or below `--workers`.
-5. **Slow startup (2.2 s, even for `--help`).** Module-level imports of
+4. **Slow startup (1.9–2.2 s, even for `--help`).** Module-level imports of
    `scipy.stats` (≈0.58 s cumulative, used only for skew, kurtosis and
    percentile ranks) and `matplotlib.pyplot` (≈0.51 s) plus `seaborn` (only
    needed with `--plots`). Idea: import them inside the functions that use
    them. Evidence: a validation run of the benchmark with lazy plotting imports
    alone measured startup −24%, cold run −8%, RSS −11% (verdict KEEP).
-6. **Daily returns recomputed about six times per fund**: 225 `pct_change`
+5. **Daily returns recomputed about six times per fund**: 225 `pct_change`
    calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown;
    `calculate_statistics` (scipy skew/kurtosis) is about 28% of compute time.
    Idea: compute returns once per fund and pass them in. Trap: results must
    stay within the golden tolerance (1e-9 relative), so keep the same pandas
    and scipy operations, just do them once.
-7. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
+6. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
    fund). Build the columns directly. Lower priority: parse plus compute is
    about 15 ms per fund against about 100 ms of network per fund in the mock.
 
@@ -96,4 +91,25 @@ Do not implement; the user decides.
 
 ## Iterations
 
-*None yet.*
+### Iteration 1 — 2026-10-15 — KEPT
+Hypothesis: discovery fetched all 40 symbols one at a time (~4 s in the mock)
+and the analysis then downloaded the 39 that resolved again. Fetching each
+symbol once, in file order with at most `--workers` in flight, and reusing
+those responses for the analysis should cut requests and connections 79 → 40,
+`requests_maxfunds5` 45 → 40, and cold and warm run time by roughly 40–50%.
+Change: `AnalizyProvider.fetch_funds` (one parallel pass, same listing rules
+as `get_fund_list`, returns the parsed quotes too); `main()` uses it and feeds
+the analysis from those quotes (`providers.py`, `analyze_polish_funds.py`).
+Seven new checks in `test_providers.py`, including that concurrency never
+exceeds `max_workers`.
+Verdict: KEEP (improved: e2e_cold_s, e2e_warm_s, requests_cold, connections_cold, requests_maxfunds5)
+
+| metric | before | after | change |
+|---|---|---|---|
+| `e2e_cold_s` | 7.92 s | 3.45 s | −56.4% |
+| `e2e_warm_s` | 7.07 s | 3.55 s | −49.7% |
+| `requests_cold` | 79 | 40 | −39 |
+| `connections_cold` | 79 | 40 | −39 |
+| `requests_maxfunds5` | 45 | 40 | −5 |
+
+Golden outputs: PASS (both). Commit: `perf: fetch each analizy fund once, in parallel`

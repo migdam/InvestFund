@@ -1909,7 +1909,14 @@ def main():
         print(f"Loaded {len(symbols)} symbols from {args.symbols_file}", file=sys.stderr)
         if args.provider == "analizy":
             from providers import AnalizyProvider
-            funds = AnalizyProvider().get_fund_list(symbols)
+            provider = AnalizyProvider()
+            # One request per symbol, at most --workers at a time; the analysis
+            # reuses the quotes from those responses instead of fetching again.
+            funds, quotes = provider.fetch_funds(symbols, max_workers=args.workers)
+            analyzer.quote_source = _NamedSource(
+                lambda s: quotes[s] if s in quotes else provider.download_quotes(s),
+                provider.name,
+            )
         else:
             funds = [FundInfo(symbol=s, name=s) for s in symbols]
     elif args.provider == "analizy":

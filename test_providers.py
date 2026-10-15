@@ -203,6 +203,50 @@ def run() -> int:
           funds[0].symbol == "ING35"
           and funds[0].name == "Goldman Sachs Globalny Spółek Dywidendowych")
 
+    # 13. fetch_funds: same listing rules as get_fund_list, plus parsed quotes,
+    #     one fetch per symbol, input order kept, concurrency capped.
+    import threading
+    import time as _time
+
+    empty_series = {"label": "Pusty", "series": [
+        {"id": "fund_EMPTY", "label": "Fundusz", "price": []}]}
+    responses = {"ING35": REAL_SHAPE_PAYLOAD, "DIV": DIVIDEND_PAYLOAD,
+                 "EMPTY": empty_series}
+    calls, in_flight, peak = [], [0], [0]
+    lock = threading.Lock()
+
+    def stub_fetch(sym):
+        with lock:
+            calls.append(sym)
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+        _time.sleep(0.02)
+        with lock:
+            in_flight[0] -= 1
+        return responses.get(sym)
+
+    prov = AnalizyProvider()
+    prov._fetch_json = stub_fetch
+    order = ["DIV", "MISSING", "ING35", "EMPTY"]
+    funds, quotes = prov.fetch_funds(order, max_workers=2)
+    check("fetch_funds lists resolved symbols in input order",
+          [f.symbol for f in funds] == ["DIV", "ING35", "EMPTY"],
+          f"got {[f.symbol for f in funds]}")
+    check("fetch_funds names funds by label",
+          [f.name for f in funds] == ["Some Distribution Fund",
+                                      "Goldman Sachs Globalny Spółek Dywidendowych",
+                                      "Pusty"])
+    check("fetch_funds fetches each symbol exactly once",
+          sorted(calls) == sorted(order), f"calls={calls}")
+    check("fetch_funds returns parsed quotes",
+          abs(quotes["ING35"]["Close"].iloc[-1] - 483.39) < 1e-9
+          and abs(quotes["DIV"]["Close"].iloc[-1] - 50.5) < 1e-9)
+    check("fetch_funds keeps a listed symbol with no prices as None",
+          "EMPTY" in quotes and quotes["EMPTY"] is None)
+    check("fetch_funds omits unresolved symbols from quotes", "MISSING" not in quotes)
+    check("fetch_funds never exceeds max_workers in flight",
+          1 <= peak[0] <= 2, f"peak={peak[0]}")
+
     print()
     if failures:
         print(f"PROVIDER TESTS: {failures} failed")
