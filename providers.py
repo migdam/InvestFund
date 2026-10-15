@@ -232,7 +232,7 @@ class AnalizyProvider(DataProvider):
             funds.append(FundInfo(symbol=symbol, name=name))
         return funds
 
-    def fetch_funds(self, symbols, max_workers: int = 10):
+    def fetch_funds(self, symbols, max_workers: int = 10, cached=None):
         """
         Fetch each symbol once; return the fund list and the parsed quotes.
 
@@ -242,6 +242,14 @@ class AnalizyProvider(DataProvider):
         time, and the quotes parsed from those same responses are returned so
         the funds can be analyzed without downloading them again.
 
+        Parameters
+        ----------
+        cached : callable, optional
+            ``cached(symbol) -> Optional[pd.DataFrame]`` returning fresh
+            cached quotes (e.g. ``FundAnalyzer.cached_quotes``). Fetched quotes
+            record the fund's name in ``df.attrs["name"]`` so it is cached with
+            them; a cached entry with a name is listed without a request.
+
         Returns
         -------
         (list[FundInfo], dict[str, Optional[pd.DataFrame]])
@@ -249,11 +257,17 @@ class AnalizyProvider(DataProvider):
             payload holds no usable prices).
         """
         def fetch(symbol):
+            hit = cached(symbol) if cached is not None else None
+            if hit is not None and hit.attrs.get("name"):
+                return hit.attrs["name"], hit
             payload = self._fetch_json(symbol)
             if payload is None:
                 return None
             name = self.parse_label(payload) or symbol
-            return name, self.parse_payload(payload, prefer_dividend=self.prefer_dividend)
+            df = self.parse_payload(payload, prefer_dividend=self.prefer_dividend)
+            if df is not None:
+                df.attrs["name"] = name  # travels with the quotes into the cache
+            return name, df
 
         symbols = list(symbols)
         with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:

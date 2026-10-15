@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 1
+- **Iterations logged:** 2
 
 ## Summary
 
@@ -38,38 +38,34 @@ analizy.pl costs will differ, but the direction of each change carries over.
 
 Ordered by expected gain. Each item: evidence, idea, trap.
 
-1. **Warm runs still use the network** (`requests_warm` 40, warm run 3.55 s
-   after iteration 1). `fetch_funds` always downloads every symbol to learn
-   its name, even when the analyzer's cache already holds its quotes; the cache
-   stores only the DataFrame, not the name. Idea: cache the name together with
-   the quotes and let the fetch step serve cached symbols without a request.
-   Trap: names must come out exactly as before, and a symbol that is cached
-   must still count as "resolved" for `--max-funds`.
-2. **`--max-funds` still fetches every symbol** (`requests_maxfunds5` 40 for
+1. **`--max-funds` still fetches every symbol** (`requests_maxfunds5` 40 for
    5 funds). Fetch in file order only until N symbols have resolved (batches
    of at most `--workers`). Trap: the option means "the first N symbols that
    resolve, in file order"; a too-short fund still counts toward N and is then
    skipped. Slicing the raw symbol list first fails `golden_maxfunds5.json`
    (verified).
-3. **No connection reuse** (`connections_cold` 40, one per request). Each `requests.get` opens a
+2. **No connection reuse** (`connections_cold` 40, one per request). Each `requests.get` opens a
    new connection. Idea: reuse connections via `requests.Session`; one session
    per worker thread (`threading.local`) is the safe pattern, as `Session` is
    not documented as thread-safe. Keep concurrency at or below `--workers`.
-4. **Slow startup (1.9–2.2 s, even for `--help`).** Module-level imports of
+3. **Slow startup (1.9–2.2 s, even for `--help`).** Module-level imports of
    `scipy.stats` (≈0.58 s cumulative, used only for skew, kurtosis and
    percentile ranks) and `matplotlib.pyplot` (≈0.51 s) plus `seaborn` (only
    needed with `--plots`). Idea: import them inside the functions that use
    them. Evidence: a validation run of the benchmark with lazy plotting imports
    alone measured startup −24%, cold run −8%, RSS −11% (verdict KEEP).
-5. **Daily returns recomputed about six times per fund**: 225 `pct_change`
+4. **Daily returns recomputed about six times per fund**: 225 `pct_change`
    calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown;
    `calculate_statistics` (scipy skew/kurtosis) is about 28% of compute time.
    Idea: compute returns once per fund and pass them in. Trap: results must
    stay within the golden tolerance (1e-9 relative), so keep the same pandas
    and scipy operations, just do them once.
-6. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
+5. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
    fund). Build the columns directly. Lower priority: parse plus compute is
    about 15 ms per fund against about 100 ms of network per fund in the mock.
+6. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
+   get the name, then `download_quotes` loads it again for the analysis
+   (39 extra loads per warm run). Not measured yet; likely small.
 
 ## Needs approval
 
@@ -113,3 +109,29 @@ Verdict: KEEP (improved: e2e_cold_s, e2e_warm_s, requests_cold, connections_cold
 | `requests_maxfunds5` | 45 | 40 | −5 |
 
 Golden outputs: PASS (both). Commit: `perf: fetch each analizy fund once, in parallel`
+
+### Iteration 2 — 2026-10-15 — KEPT
+Hypothesis: a warm run downloaded all 40 symbols only to learn the names of 39
+funds whose quotes were already cached. Storing the name with the cached quotes
+(`df.attrs`, which survives the pickle cache) and listing cached funds without
+a request should cut `requests_warm` 40 → 1 (only the uncached 404 symbol is
+asked again) and `e2e_warm_s` by about 10–15%. This also matches the README's
+documented caching ("fund list cached for 1 day", "work offline if the cache
+is fresh"), which the analizy path did not honor.
+Change: `FundAnalyzer.cached_quotes` (read-only cache lookup; `download_quotes`
+now uses it), `fetch_funds(..., cached=...)` serves named cache entries and
+stamps the name on fetched quotes; `main()` passes the analyzer's cache
+(`analyze_polish_funds.py`, `providers.py`). Seven new checks in
+`test_providers.py`, including a round trip through the on-disk cache.
+Edge case, by design: a fund that stops resolving within the 1-day cache
+lifetime is now still listed from cache, as its cached quotes already were.
+Cache files written before this change carry no name, so they are fetched once
+more until they expire.
+Verdict: KEEP (improved: requests_warm)
+
+| metric | before | after | change |
+|---|---|---|---|
+| `requests_warm` | 40 | 1 | −39 |
+| `e2e_warm_s` | 4.06 s | 3.04 s | −25.1%, classed as noise (±14% spread) |
+
+Golden outputs: PASS (both). Commit: `perf: list cached analizy funds without a request`

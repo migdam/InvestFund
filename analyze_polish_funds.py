@@ -305,6 +305,28 @@ class FundAnalyzer:
 
         return funds
 
+    def _cache_file(self, symbol: str) -> Path:
+        """Cache path for a symbol, namespaced by data source so providers don't collide."""
+        source_tag = getattr(self.quote_source, "name", "stooq") if self.quote_source else "stooq"
+        return self.cache_dir / f"{source_tag}__{symbol.replace('.', '_')}.pkl"
+
+    def cached_quotes(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Return the symbol's cached quotes if caching is on and the entry is fresh, else None."""
+        cache_file = self._cache_file(symbol)
+        if not (self.use_cache and cache_file.exists()):
+            return None
+        try:
+            cache_age = datetime.datetime.now() - datetime.datetime.fromtimestamp(
+                cache_file.stat().st_mtime
+            )
+            if cache_age.days < CACHE_EXPIRY_DAYS:
+                with open(cache_file, "rb") as f:
+                    return pickle.load(f)
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+            # Cache file was deleted, corrupted, or incomplete - ignore and re-download
+            pass
+        return None
+
     def download_quotes(self, symbol: str, max_retries: int = 3) -> Optional[pd.DataFrame]:
         """
         Fetch historical daily quotes for a given fund symbol.
@@ -321,23 +343,10 @@ class FundAnalyzer:
         pd.DataFrame or None
             DataFrame with Date, Open, High, Low, Close, Volume columns
         """
-        # Namespace cache by source so different providers don't collide
-        source_tag = getattr(self.quote_source, "name", "stooq") if self.quote_source else "stooq"
-        safe_symbol = symbol.replace('.', '_')
-        cache_file = self.cache_dir / f"{source_tag}__{safe_symbol}.pkl"
-
-        # Check cache (with race condition protection)
-        if self.use_cache and cache_file.exists():
-            try:
-                cache_age = datetime.datetime.now() - datetime.datetime.fromtimestamp(
-                    cache_file.stat().st_mtime
-                )
-                if cache_age.days < CACHE_EXPIRY_DAYS:
-                    with open(cache_file, "rb") as f:
-                        return pickle.load(f)
-            except (FileNotFoundError, EOFError, pickle.UnpicklingError):
-                # Cache file was deleted, corrupted, or incomplete - ignore and re-download
-                pass
+        cache_file = self._cache_file(symbol)
+        cached = self.cached_quotes(symbol)
+        if cached is not None:
+            return cached
 
         # If an external provider is configured, use it (then cache the result)
         if self.quote_source is not None:
@@ -1910,9 +1919,11 @@ def main():
         if args.provider == "analizy":
             from providers import AnalizyProvider
             provider = AnalizyProvider()
-            # One request per symbol, at most --workers at a time; the analysis
-            # reuses the quotes from those responses instead of fetching again.
-            funds, quotes = provider.fetch_funds(symbols, max_workers=args.workers)
+            # At most one request per symbol (none if its quotes and name are
+            # freshly cached), at most --workers at a time; the analysis reuses
+            # these quotes instead of fetching again.
+            funds, quotes = provider.fetch_funds(symbols, max_workers=args.workers,
+                                                 cached=analyzer.cached_quotes)
             analyzer.quote_source = _NamedSource(
                 lambda s: quotes[s] if s in quotes else provider.download_quotes(s),
                 provider.name,

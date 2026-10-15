@@ -246,6 +246,42 @@ def run() -> int:
     check("fetch_funds omits unresolved symbols from quotes", "MISSING" not in quotes)
     check("fetch_funds never exceeds max_workers in flight",
           1 <= peak[0] <= 2, f"peak={peak[0]}")
+    check("fetched quotes record the fund name",
+          quotes["ING35"].attrs.get("name") == "Goldman Sachs Globalny Spółek Dywidendowych")
+
+    # 14. fetch_funds with a cache: named entries are served without a request,
+    #     unnamed (older) entries are fetched, and names survive the disk cache.
+    import tempfile
+    from pathlib import Path as _Path
+    from analyze_polish_funds import FundAnalyzer, _NamedSource
+
+    named = AnalizyProvider.parse_payload(REAL_SHAPE_PAYLOAD)
+    named.attrs["name"] = "Cached Name"
+    unnamed = AnalizyProvider.parse_payload(DIVIDEND_PAYLOAD)
+    cache = {"ING35": named, "DIV": unnamed}
+    calls.clear()
+    funds, quotes = prov.fetch_funds(["ING35", "DIV", "MISSING"], max_workers=2,
+                                     cached=cache.get)
+    check("cached entry with a name needs no request", "ING35" not in calls,
+          f"calls={calls}")
+    check("cached entry without a name is fetched", "DIV" in calls)
+    check("names come from the cache or the payload",
+          [(f.symbol, f.name) for f in funds]
+          == [("ING35", "Cached Name"), ("DIV", "Some Distribution Fund")])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = _NamedSource(lambda s: quotes.get(s), "analizy")
+        writer = FundAnalyzer(use_cache=True, cache_dir=_Path(tmp), quote_source=source)
+        writer.download_quotes("DIV")  # cache miss: stores the quotes
+        reader = FundAnalyzer(use_cache=True, cache_dir=_Path(tmp), quote_source=source)
+        hit = reader.cached_quotes("DIV")
+        check("cached_quotes returns stored quotes with their name",
+              hit is not None and hit.attrs.get("name") == "Some Distribution Fund")
+        check("cached_quotes returns None for an uncached symbol",
+              reader.cached_quotes("NOPE") is None)
+        no_cache = FundAnalyzer(use_cache=False, cache_dir=_Path(tmp), quote_source=source)
+        check("cached_quotes returns None when caching is off",
+              no_cache.cached_quotes("DIV") is None)
 
     print()
     if failures:
