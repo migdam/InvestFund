@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 3
+- **Iterations logged:** 4
 
 ## Summary
 
@@ -38,26 +38,22 @@ analizy.pl costs will differ, but the direction of each change carries over.
 
 Ordered by expected gain. Each item: evidence, idea, trap.
 
-1. **No connection reuse** (`connections_cold` 40, one per request). Each `requests.get` opens a
-   new connection. Idea: reuse connections via `requests.Session`; one session
-   per worker thread (`threading.local`) is the safe pattern, as `Session` is
-   not documented as thread-safe. Keep concurrency at or below `--workers`.
-2. **Slow startup (1.8–2.2 s, even for `--help`).** Module-level imports of
+1. **Slow startup (1.8–2.2 s, even for `--help`).** Module-level imports of
    `scipy.stats` (≈0.58 s cumulative, used only for skew, kurtosis and
    percentile ranks) and `matplotlib.pyplot` (≈0.51 s) plus `seaborn` (only
    needed with `--plots`). Idea: import them inside the functions that use
    them. Evidence: a validation run of the benchmark with lazy plotting imports
    alone measured startup −24%, cold run −8%, RSS −11% (verdict KEEP).
-3. **Daily returns recomputed about six times per fund**: 225 `pct_change`
+2. **Daily returns recomputed about six times per fund**: 225 `pct_change`
    calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown;
    `calculate_statistics` (scipy skew/kurtosis) is about 28% of compute time.
    Idea: compute returns once per fund and pass them in. Trap: results must
    stay within the golden tolerance (1e-9 relative), so keep the same pandas
    and scipy operations, just do them once.
-4. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
+3. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
    fund). Build the columns directly. Lower priority: parse plus compute is
    about 15 ms per fund against about 100 ms of network per fund in the mock.
-5. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
+4. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
    get the name, then `download_quotes` loads it again for the analysis
    (39 extra loads per warm run). Not measured yet; likely small.
 
@@ -153,3 +149,23 @@ Verdict: KEEP (improved: requests_maxfunds5)
 
 Golden outputs: PASS (both; `--max-funds 5` still yields the same 4 funds).
 Commit: `perf: stop fetching once --max-funds symbols have resolved`
+
+### Iteration 4 — 2026-10-15 — KEPT
+Hypothesis: every request opened a new connection (`connections_cold` 40),
+paying the handshake each time. Reusing one keep-alive connection per worker
+thread (a `requests.Session` per thread; `Session` is not documented as
+thread-safe) should cut `connections_cold` 40 → at most 10 with requests
+unchanged. Only ~3 handshakes per worker are saved (~0.2 s in the mock), so
+the run time should stay within noise; on real HTTPS each saved handshake is
+worth more.
+Change: `AnalizyProvider` keeps a thread-local `requests.Session` and
+`_fetch_json` uses it (`providers.py`). Four new checks in `test_providers.py`
+make real HTTP round trips against the local mock (one connection per thread,
+errors still return None); reverting to `requests.get` fails them (checked).
+Verdict: KEEP (improved: connections_cold)
+
+| metric | before | after | change |
+|---|---|---|---|
+| `connections_cold` | 40 | 10 | −30 |
+
+Golden outputs: PASS (both). Commit: `perf: reuse one keep-alive connection per worker thread`

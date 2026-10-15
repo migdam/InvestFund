@@ -308,6 +308,29 @@ def run() -> int:
     check("a cached fund counts toward the limit without a request",
           calls == [] and [f.symbol for f in from_cache] == ["DIV"], f"calls={calls}")
 
+    # 16. Real HTTP round trips against the local mock server: each thread
+    #     keeps one keep-alive connection, and errors still return None.
+    sys.path.insert(0, str(_Path(__file__).resolve().parent / "bench"))
+    import mock_analizy
+
+    with mock_analizy.MockAnalizyServer(connect_latency=0, request_latency=0) as server:
+        live = AnalizyProvider()
+        live.BASE_URL = server.url_template
+        payloads = [live._fetch_json(s) for s in ("BENCH00", "BENCH01", "BENCH02")]
+        check("live fetch returns payloads", all(isinstance(p, dict) for p in payloads))
+        check("one thread reuses a single connection",
+              server.stats.requests == 3 and server.stats.connections == 1,
+              f"requests={server.stats.requests} connections={server.stats.connections}")
+        server.stats.reset()
+        worker = threading.Thread(target=live._fetch_json, args=("BENCH03",))
+        worker.start()
+        worker.join()
+        check("another thread opens its own connection",
+              server.stats.requests == 1 and server.stats.connections == 1,
+              f"requests={server.stats.requests} connections={server.stats.connections}")
+        check("an unknown symbol still returns None",
+              live._fetch_json("MISSING01") is None)
+
     print()
     if failures:
         print(f"PROVIDER TESTS: {failures} failed")

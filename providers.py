@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional
@@ -110,13 +111,22 @@ class AnalizyProvider(DataProvider):
         self.fund_type = fund_type
         self.timeout = timeout
         self.headers = headers or _DEFAULT_HEADERS
+        # One requests.Session per thread: keep-alive connections are reused
+        # across requests, and no Session is shared between threads.
+        self._local = threading.local()
 
     # -- network ---------------------------------------------------------
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._local.session = requests.Session()
+        return session
 
     def _fetch_json(self, symbol: str) -> Optional[dict]:
         url = self.BASE_URL.format(fund_type=self.fund_type, symbol=symbol)
         try:
-            resp = requests.get(url, headers=self.headers, timeout=self.timeout)
+            resp = self._session().get(url, headers=self.headers, timeout=self.timeout)
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:
