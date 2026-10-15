@@ -9,7 +9,46 @@ reads this file first and appends to it last.
 
 ## Summary
 
-*Written at Finish.*
+**Stopped after 9 iterations (8 kept, 1 reverted), on 2026-10-15.** Stop
+condition met: both remaining backlog items measured below the 5% bar even at
+their theoretical best, and a fresh profile showed nothing else that size
+avoidable within the rules (see *Tried and rejected*).
+
+Start (`e5d49e1`) vs final, measured back to back on the same machine:
+
+| metric | start | final | change |
+|---|---|---|---|
+| `cli_startup_s` | 1.86 s | 0.60 s | −67.8% |
+| `e2e_cold_s` | 8.12 s | 1.54 s | −81.0% (5.3× faster) |
+| `e2e_cold_cpu_s` | 4.16 s | 1.58 s | −62.0% |
+| `e2e_cold_rss_mb` | 242 MB | 149 MB | −38.6% |
+| `e2e_warm_s` | 7.11 s | 1.11 s | −84.4% (6.4× faster) |
+| `compute_ms_per_fund` | 4.71 ms | 4.00 ms | −15.0% |
+| `parse_ms_per_fund` | 6.62 ms | 7.91 ms | drift, not a regression: `parse_payload` is unchanged, and an interleaved re-measure gave 6.35 vs 6.53 ms (overlapping) |
+| `requests_cold` | 79 | 40 | −39 |
+| `connections_cold` | 79 | 10 | −69 |
+| `requests_warm` | 40 | 1 | −39 |
+| `requests_maxfunds5` | 45 | 6 | −39 |
+
+Golden outputs PASS at both ends. Kept changes, in order:
+`315e969` fetch each fund once, in parallel · `a70cf44` list cached funds
+without a request · `e7ff290` stop fetching once `--max-funds` symbols
+resolved · `c72023e` one keep-alive connection per worker thread · `97189fe`
+plotting libraries and bs4 imported only where used · `a0f22f4` skew,
+kurtosis and percentile ranks without scipy (test corrected in `989ab05`
+after a CI failure on Python 3.12) · `11c8b42` analyze prefetched funds in
+one worker · `fa44556` parse responses outside the download threads.
+
+Reverted: iteration 7 (leaner `parse_payload`, −38% parse time, not
+confirmable end to end at this machine's noise).
+
+Not verified here: the live analizy.pl path. `test_analyzer.py` calls the real
+site, which is unreachable from this cloud environment; run it once locally.
+
+Your decisions (see *Needs approval*): more end-to-end benchmark repeats, which
+would likely let iteration 7's parsing win through (~0.1 s); a faster JSON or
+DataFrame library (new dependency). What remains otherwise is mostly importing
+pandas (~0.3 s) and, in the mock, the simulated network.
 
 ## Baseline
 
@@ -36,7 +75,8 @@ analizy.pl costs will differ, but the direction of each change carries over.
 
 ## Backlog
 
-Ordered by expected gain. Each item: evidence, idea, trap. After iteration 6 a
+Empty: the last two items were measured below the 5% bar and moved to *Tried
+and rejected*. The notes below are kept for reference. After iteration 6 a
 cold run takes about 2.1 s: ~0.5 s startup (pandas, numpy, requests — all
 needed), ~0.2 s network in the mock, then parsing and metrics.
 
@@ -72,6 +112,14 @@ Do not implement; the user decides.
   backoff) even on HTTP 4xx, sending requests that cannot succeed.
 
 ## Tried and rejected
+
+- **Measured below the bar, not attempted** (at stop, 5% of a cold run was
+  ~74 ms): recomputing daily returns once per fund could save at most 54 ms
+  per 39-fund run (3.6%); reading each cache file once on warm runs at most
+  9 ms (under 1%). Fresh profile at stop: imports ~410 ms (pandas 280, requests
+  75, numpy 49, all needed), fetch and parse ~610 ms (of which ~220 ms is the
+  mock's network model with concurrency capped by `--workers`), analysis
+  ~210–250 ms, summary and exports ~24 ms.
 
 - **Iteration 7 — leaner `parse_payload`** (one mask, one DataFrame
   constructor, sort only when dates are not strictly increasing). Real CPU win:
