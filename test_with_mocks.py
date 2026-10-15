@@ -902,26 +902,57 @@ def run_tests():
         results.add("Heavy libraries load lazily", False, str(e), time.time()-start)
 
     # ========================================================================
-    # Test 37: NumPy statistics are bit-identical to scipy.stats
+    # Test 37: NumPy statistics reproduce scipy.stats exactly
     # ========================================================================
+    # _skew_kurtosis repeats scipy 1.17's arithmetic, so its output must equal
+    # what scipy 1.17.1 produced, bit for bit. Those values are frozen here
+    # because scipy 1.18 rounds moments differently (relative differences
+    # around 1e-14); against the installed scipy the check is agreement to
+    # rounding error instead. Constant data (NaN) and percentile ranks still
+    # match the installed scipy exactly.
     start = time.time()
     try:
+        import math
         from scipy import stats as scipy_stats
         from analyze_polish_funds import _skew_kurtosis, _percentile_rank
 
         def same(a, b):
             return (np.isnan(a) and np.isnan(b)) or a == b
 
-        samples = []
-        for seed in range(40):
+        def sample(seed):
             r = np.random.default_rng(seed)
             n = int(r.integers(29, 3000))
-            samples.append(r.normal(0.0003, 0.01, n) if seed % 2 else r.standard_t(3, n) * 0.01)
-        samples += [np.full(50, 0.001), np.zeros(40)]  # constant data -> NaN
-        for x in samples:
+            return r.normal(0.0003, 0.01, n) if seed % 2 else r.standard_t(3, n) * 0.01
+
+        scipy_1_17_reference = {  # (skew, kurtosis) from scipy 1.17.1
+            0: ("0x1.d46147afa5fb1p+0", "0x1.d07b00db60ef0p+4"),
+            1: ("0x1.64795890ea92fp-13", "0x1.7239b25dbe240p-4"),
+            2: ("0x1.e6d20df45e8b9p-2", "0x1.1299d41c45017p+3"),
+            3: ("-0x1.e5bb465d288bbp-6", "0x1.84d9257a23c00p-7"),
+            4: ("-0x1.3812a6480ac5cp-1", "0x1.7c479fcf42a1cp+4"),
+            5: ("-0x1.003e9c7d1433ap-4", "-0x1.cd96925aa2600p-6"),
+            6: ("-0x1.6a25736fd56fep-3", "0x1.122e4c292f735p+3"),
+            7: ("0x1.3c6f29c75d2b1p-4", "-0x1.dd47d77f1a440p-5"),
+            8: ("-0x1.64b97458fae1ep+1", "0x1.1cc10389aa9bcp+5"),
+            9: ("-0x1.2cab6efe9841ap-5", "-0x1.7c7f82e90f880p-4"),
+            10: ("-0x1.14cb98017cfb4p+0", "0x1.c8290c3284a10p+3"),
+            11: ("-0x1.3dbd76dbd8efap-6", "0x1.a808dc7164c28p-2"),
+        }
+        for seed, (skew_ref, kurt_ref) in scipy_1_17_reference.items():
+            sk, ku = _skew_kurtosis(pd.Series(sample(seed)))
+            assert float(sk).hex() == skew_ref, f"skew differs from scipy 1.17 (seed {seed})"
+            assert float(ku).hex() == kurt_ref, f"kurtosis differs from scipy 1.17 (seed {seed})"
+
+        for seed in range(40):
+            x = sample(seed)
             sk, ku = _skew_kurtosis(pd.Series(x))
-            assert same(sk, scipy_stats.skew(x)), f"skew differs for n={len(x)}"
-            assert same(ku, scipy_stats.kurtosis(x)), f"kurtosis differs for n={len(x)}"
+            assert math.isclose(sk, scipy_stats.skew(x), rel_tol=1e-12, abs_tol=1e-15), \
+                f"skew disagrees with installed scipy (seed {seed})"
+            assert math.isclose(ku, scipy_stats.kurtosis(x), rel_tol=1e-12, abs_tol=1e-15), \
+                f"kurtosis disagrees with installed scipy (seed {seed})"
+        for x in (np.full(50, 0.001), np.zeros(40)):  # constant data -> NaN
+            sk, ku = _skew_kurtosis(pd.Series(x))
+            assert same(sk, scipy_stats.skew(x)) and same(ku, scipy_stats.kurtosis(x))
 
         for seed in range(40):
             r = np.random.default_rng(seed)

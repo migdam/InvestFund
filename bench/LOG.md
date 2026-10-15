@@ -223,3 +223,22 @@ Verdict: KEEP (improved: cli_startup_s, e2e_cold_s, e2e_cold_cpu_s, e2e_cold_rss
 | `e2e_warm_s` | 2.29 s | 1.31 s | −42.9% |
 
 Golden outputs: PASS (both). Commit: `perf: compute skew, kurtosis and percentile ranks without scipy`
+
+### Fix after iteration 6 — 2026-10-15 — CI failure on Python 3.12
+CI failed on the iteration-6 commit, only on Python 3.12, which installs
+numpy 2.5.4 and scipy 1.18.1 (this machine and Python 3.11: 2.4.6 / 1.17.1).
+Reproduced in a local 3.12 environment. Cause: scipy 1.18 rewrote `_moment`
+(`mean(d**order)` instead of squaring), so its skew/kurtosis differ from 1.17
+by up to 5.5e-14 relative, and iteration 6's test demanded bit-identity with
+whatever scipy is installed. The app was fine: the golden check and every
+other suite pass on the 3.12 stack, and the NumPy code gives bit-identical
+results on numpy 2.2, 2.4 and 2.5.
+Fix (test only, nothing loosened): the exact check now compares with frozen
+values scipy 1.17.1 produced, the version the code replicates; a separate
+added check requires agreement with the installed scipy to rounding error
+(1e-12 relative). Constant data and percentile ranks still match the installed
+scipy exactly (scipy 1.18: 3,681/3,681). Verified on Python 3.10, 3.11 and 3.12
+stacks; the `d**3` mutation fails it on all three.
+Lesson for later iterations: before pushing a change that depends on library
+behavior, run the suites on CI's newest stack too (`uv venv --python 3.12`).
+Commit: `test: compare NumPy statistics with frozen scipy 1.17 values`
