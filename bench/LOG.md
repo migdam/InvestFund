@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 4
+- **Iterations logged:** 5
 
 ## Summary
 
@@ -38,12 +38,16 @@ analizy.pl costs will differ, but the direction of each change carries over.
 
 Ordered by expected gain. Each item: evidence, idea, trap.
 
-1. **Slow startup (1.8–2.2 s, even for `--help`).** Module-level imports of
-   `scipy.stats` (≈0.58 s cumulative, used only for skew, kurtosis and
-   percentile ranks) and `matplotlib.pyplot` (≈0.51 s) plus `seaborn` (only
-   needed with `--plots`). Idea: import them inside the functions that use
-   them. Evidence: a validation run of the benchmark with lazy plotting imports
-   alone measured startup −24%, cold run −8%, RSS −11% (verdict KEEP).
+1. **`scipy.stats` is the largest remaining import** (≈0.5 s of the 1.3 s
+   startup; startup is now mostly pandas + scipy). Unlike the plotting
+   libraries it is used on every analysis run (`stats.skew` and
+   `stats.kurtosis` in `calculate_statistics`, `stats.percentileofscore` in
+   `analyze_funds`), so deferring the import only helps `--help` and other
+   non-analysis modes. Computing those three with NumPy instead would help
+   every run. Trap: results must stay within the golden tolerance (1e-9
+   relative) and `percentileofscore`'s default `kind="rank"` tie handling must
+   be reproduced exactly; profile which part of the import cost is
+   `scipy.stats` itself.
 2. **Daily returns recomputed about six times per fund**: 225 `pct_change`
    calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown;
    `calculate_statistics` (scipy skew/kurtosis) is about 28% of compute time.
@@ -169,3 +173,28 @@ Verdict: KEEP (improved: connections_cold)
 | `connections_cold` | 40 | 10 | −30 |
 
 Golden outputs: PASS (both). Commit: `perf: reuse one keep-alive connection per worker thread`
+
+### Iteration 5 — 2026-10-15 — KEPT
+Hypothesis: `matplotlib.pyplot` and `seaborn` (≈0.4 s or more of imports, plus
+memory) and `bs4` (≈0.05 s) loaded on every run, although only `--plots` and
+the Stooq listing use them. Importing them where they are used should cut
+`cli_startup_s` by about 20–25%, `e2e_cold_rss_mb` by about 10%, and run time
+by about 0.4 s (positive-control run: −24% / −11% / −8%).
+Change: `_plotting_libs()` imports matplotlib/seaborn inside
+`create_visualizations`; `BeautifulSoup` is imported inside the Stooq
+`get_fund_list` (`analyze_polish_funds.py`). The import-time "plotting
+disabled" warning is gone; `--plots` without the libraries still prints its
+existing skip message. New test in `test_with_mocks.py`: importing the module
+loads none of the three (an eager import fails it, checked). A real `--plots`
+CLI run still writes both charts at 4168×2968 px.
+Verdict: KEEP (improved: cli_startup_s, e2e_cold_s, e2e_cold_cpu_s, e2e_cold_rss_mb, e2e_warm_s)
+
+| metric | before | after | change |
+|---|---|---|---|
+| `cli_startup_s` | 1.95 s | 1.32 s | −32.5% |
+| `e2e_cold_s` | 3.56 s | 3.03 s | −14.9% |
+| `e2e_cold_cpu_s` | 3.76 s | 3.28 s | −12.6% |
+| `e2e_cold_rss_mb` | 243 MB | 213 MB | −12.6% |
+| `e2e_warm_s` | 2.77 s | 2.12 s | −23.6% |
+
+Golden outputs: PASS (both). Commit: `perf: import plotting libraries and bs4 only where used`

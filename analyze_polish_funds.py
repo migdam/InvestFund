@@ -39,7 +39,6 @@ import json
 import os
 import pickle
 import sys
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -49,18 +48,23 @@ from io import StringIO
 import numpy as np
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 from scipy import stats
 from tqdm import tqdm
 
-# Optional imports for visualization
-try:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    PLOT_AVAILABLE = True
-except ImportError:
-    PLOT_AVAILABLE = False
-    warnings.warn("matplotlib/seaborn not available. Plotting features disabled.")
+
+def _plotting_libs():
+    """
+    Import matplotlib and seaborn on first use, or return None if missing.
+
+    Only --plots needs them, and importing them costs about half a second, so
+    they are not imported with this module.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        return None
+    return plt, sns
 
 
 # Constants
@@ -254,6 +258,7 @@ class FundAnalyzer:
         # Download fresh data
         resp = requests.get(url, headers=self.headers, timeout=30)
         resp.raise_for_status()
+        from bs4 import BeautifulSoup  # only this Stooq listing parser needs it
         soup = BeautifulSoup(resp.text, "html.parser")
 
         # Find the table with fund listings
@@ -1463,9 +1468,11 @@ class FundAnalyzer:
         output_dir : str
             Directory for saving plots
         """
-        if not PLOT_AVAILABLE:
+        libs = _plotting_libs()
+        if libs is None:
             print("Plotting libraries not available. Skipping visualizations.", file=sys.stderr)
             return
+        plt, sns = libs
 
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)

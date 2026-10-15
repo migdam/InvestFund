@@ -881,6 +881,25 @@ def run_tests():
     except Exception as e:
         results.add("Load Portfolio JSON/CSV", False, str(e), time.time()-start)
 
+    # ========================================================================
+    # Test 36: Optional libraries are not imported with the module
+    # ========================================================================
+    start = time.time()
+    try:
+        import subprocess
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, analyze_polish_funds; "
+             "print(sorted(m for m in ('matplotlib.pyplot', 'seaborn', 'bs4') if m in sys.modules))"],
+            cwd=str(Path(__file__).parent), capture_output=True, text=True, timeout=120,
+        )
+        loaded = probe.stdout.strip()
+        assert probe.returncode == 0, probe.stderr[-500:]
+        assert loaded == "[]", f"loaded at import: {loaded}"
+        results.add("Optional libraries load lazily", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Optional libraries load lazily", False, str(e), time.time()-start)
+
     # Print summary
     print()
     success = results.summary()
