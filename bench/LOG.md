@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 7
+- **Iterations logged:** 8
 
 ## Summary
 
@@ -40,14 +40,21 @@ Ordered by expected gain. Each item: evidence, idea, trap. After iteration 6 a
 cold run takes about 2.1 s: ~0.5 s startup (pandas, numpy, requests — all
 needed), ~0.2 s network in the mock, then parsing and metrics.
 
-1. **Daily returns recomputed about six times per fund**: 225 `pct_change`
+1. **Parsing runs inside the 10 download threads.** `fetch_funds` parses
+   each payload in the worker that fetched it, so up to 10 threads run
+   CPU-bound pandas code at once; iteration 8 showed that costs about 2.7×
+   for the analysis step. Idea: keep the requests in threads but parse
+   outside them (or with less contention), keeping the overlap with network
+   waits. Trap: the mock's network phase is short (~0.25 s), so measure the
+   split first; names, order and `--max-funds` semantics must not change.
+2. **Daily returns recomputed about six times per fund**: 225 `pct_change`
    calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown.
    `compute_ms_per_fund` is now ≈3.9 ms (≈0.15 s per run, ~7%). Idea: compute
    returns once per fund and pass them in. Trap: results must stay within the
    golden tolerance (1e-9 relative), so keep the same pandas operations, just
    do them once. Expect the same outcome as iteration 7 (a microbenchmark win
    too small to confirm end to end) unless the noise is low.
-2. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
+3. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
    get the name, then `download_quotes` loads it again for the analysis
    (39 extra loads per warm run). Not measured yet; likely small.
 
@@ -269,3 +276,27 @@ Verdict: CONFIRM, then CONFIRM again after re-measuring, which counts as REVERT.
 | `e2e_cold_cpu_s` | −8.7% (noise, ±16%) | −17.7% (noise, ±10%) |
 
 Golden outputs: PASS throughout. Reverted with `git reset --hard`.
+
+### Iteration 8 — 2026-10-15 — KEPT
+Found by profiling, not from the backlog: a phase timing of a cold run left
+about 0.8 s unaccounted for, and `analyze_funds` alone took ~580 ms against
+~140 ms of metric computation. Isolated: with its 10-thread pool it takes
+451 ms for 38 funds, with one worker 171 ms, a plain loop 159 ms; cache
+writes cost ~15 ms. The pool dates from when analysis also downloaded; since
+iteration 1 the analizy path downloads everything in `fetch_funds`, so the
+pool only runs CPU-bound pandas code and its threads contend for the GIL.
+Hypothesis: analyzing prefetched funds with one worker should cut ~0.28 s from
+cold and warm runs (~13% / ~20%) and CPU time, with identical outputs.
+Change: `main()` passes `max_workers=1` to `analyze_funds` on the analizy path;
+Stooq still downloads during analysis and keeps `--workers` (whose help text
+already says it is for downloading). New test: `analyze_funds` gives identical
+results with 1 and 10 workers. Suites pass on Python 3.10/3.11/3.12 stacks.
+Verdict: KEEP (improved: e2e_cold_s, e2e_cold_cpu_s, e2e_warm_s)
+
+| metric | before | after | change |
+|---|---|---|---|
+| `e2e_cold_s` | 2.06 s | 1.72 s | −16.5% |
+| `e2e_cold_cpu_s` | 2.21 s | 1.79 s | −18.8% |
+| `e2e_warm_s` | 1.31 s | 0.96 s | −27.0% |
+
+Golden outputs: PASS (both). Commit: `perf: analyze prefetched analizy funds in one worker`

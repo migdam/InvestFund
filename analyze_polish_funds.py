@@ -1990,7 +1990,12 @@ def main():
         print(f"Analyzing first {len(funds)} funds.", file=sys.stderr)
 
     # Analyze funds
-    results = analyzer.analyze_funds(funds, max_workers=args.workers, score_weights=score_weights)
+    # With analizy every quote is already downloaded, so the analysis is pure
+    # CPU work: threads only contend for the GIL (about 2.7x slower than one
+    # worker for 38 funds). Stooq still downloads here, so it keeps --workers.
+    analysis_workers = 1 if args.provider == "analizy" else args.workers
+    results = analyzer.analyze_funds(funds, max_workers=analysis_workers,
+                                     score_weights=score_weights)
 
     if not results:
         print("No funds were successfully analyzed.", file=sys.stderr)

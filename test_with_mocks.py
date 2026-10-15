@@ -965,6 +965,29 @@ def run_tests():
     except Exception as e:
         results.add("NumPy statistics match scipy exactly", False, str(e), time.time()-start)
 
+    # ========================================================================
+    # Test 38: analyze_funds results do not depend on the number of workers
+    # ========================================================================
+    start = time.time()
+    try:
+        import contextlib
+        import io
+        np.random.seed(7)
+        data = {f"W{i}.N": MockData.generate_price_data(days=300 + 50 * i) for i in range(8)}
+        funds = [FundInfo(symbol=s, name=s) for s in data]
+
+        def summary(workers):
+            analyzer = FundAnalyzer(use_cache=False, quote_source=data.get)
+            with contextlib.redirect_stderr(io.StringIO()):
+                found = analyzer.analyze_funds(funds, max_workers=workers)
+            frame = analyzer.create_summary_dataframe(found)
+            return frame.sort_values("symbol").reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(summary(1), summary(10), check_exact=True)
+        results.add("Same results with 1 or 10 workers", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("Same results with 1 or 10 workers", False, str(e), time.time()-start)
+
     # Print summary
     print()
     success = results.summary()
