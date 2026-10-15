@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 2
+- **Iterations logged:** 3
 
 ## Summary
 
@@ -38,32 +38,26 @@ analizy.pl costs will differ, but the direction of each change carries over.
 
 Ordered by expected gain. Each item: evidence, idea, trap.
 
-1. **`--max-funds` still fetches every symbol** (`requests_maxfunds5` 40 for
-   5 funds). Fetch in file order only until N symbols have resolved (batches
-   of at most `--workers`). Trap: the option means "the first N symbols that
-   resolve, in file order"; a too-short fund still counts toward N and is then
-   skipped. Slicing the raw symbol list first fails `golden_maxfunds5.json`
-   (verified).
-2. **No connection reuse** (`connections_cold` 40, one per request). Each `requests.get` opens a
+1. **No connection reuse** (`connections_cold` 40, one per request). Each `requests.get` opens a
    new connection. Idea: reuse connections via `requests.Session`; one session
    per worker thread (`threading.local`) is the safe pattern, as `Session` is
    not documented as thread-safe. Keep concurrency at or below `--workers`.
-3. **Slow startup (1.9–2.2 s, even for `--help`).** Module-level imports of
+2. **Slow startup (1.8–2.2 s, even for `--help`).** Module-level imports of
    `scipy.stats` (≈0.58 s cumulative, used only for skew, kurtosis and
    percentile ranks) and `matplotlib.pyplot` (≈0.51 s) plus `seaborn` (only
    needed with `--plots`). Idea: import them inside the functions that use
    them. Evidence: a validation run of the benchmark with lazy plotting imports
    alone measured startup −24%, cold run −8%, RSS −11% (verdict KEEP).
-4. **Daily returns recomputed about six times per fund**: 225 `pct_change`
+3. **Daily returns recomputed about six times per fund**: 225 `pct_change`
    calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown;
    `calculate_statistics` (scipy skew/kurtosis) is about 28% of compute time.
    Idea: compute returns once per fund and pass them in. Trap: results must
    stay within the golden tolerance (1e-9 relative), so keep the same pandas
    and scipy operations, just do them once.
-5. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
+4. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
    fund). Build the columns directly. Lower priority: parse plus compute is
    about 15 ms per fund against about 100 ms of network per fund in the mock.
-6. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
+5. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
    get the name, then `download_quotes` loads it again for the analysis
    (39 extra loads per warm run). Not measured yet; likely small.
 
@@ -135,3 +129,27 @@ Verdict: KEEP (improved: requests_warm)
 | `e2e_warm_s` | 4.06 s | 3.04 s | −25.1%, classed as noise (±14% spread) |
 
 Golden outputs: PASS (both). Commit: `perf: list cached analizy funds without a request`
+
+### Iteration 3 — 2026-10-15 — KEPT
+Hypothesis: `--max-funds 5` fetched all 40 symbols and then kept the first 5
+that resolved. Fetching in file order only until N symbols have resolved (a
+batch of N, then one more batch per failure) should cut `requests_maxfunds5`
+40 → 6 (the first five include the 404, so one extra symbol is needed) with
+identical output, and leave the other scenarios unchanged (40 symbols is below
+the default `--max-funds` of 50).
+Change: `fetch_funds(..., limit=N)` fetches the shortest prefix of the symbol
+list that holds N resolved symbols, so it lists exactly what a full fetch would
+list first; cached funds count toward N without a request. `main()` passes
+`--max-funds` and says so on the console (`providers.py`,
+`analyze_polish_funds.py`). Five new checks in `test_providers.py`.
+Note: `--max-funds` defaults to 50, so a plain run on more than 50 symbols now
+also stops once 50 have resolved (same mechanism; not exercised by the
+40-symbol benchmark).
+Verdict: KEEP (improved: requests_maxfunds5)
+
+| metric | before | after | change |
+|---|---|---|---|
+| `requests_maxfunds5` | 40 | 6 | −34 |
+
+Golden outputs: PASS (both; `--max-funds 5` still yields the same 4 funds).
+Commit: `perf: stop fetching once --max-funds symbols have resolved`

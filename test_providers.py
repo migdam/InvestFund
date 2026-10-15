@@ -283,6 +283,31 @@ def run() -> int:
         check("cached_quotes returns None when caching is off",
               no_cache.cached_quotes("DIV") is None)
 
+    # 15. fetch_funds(limit=N): fetch in order only until N symbols resolve,
+    #     listing exactly what a full fetch would list first.
+    order = ["DIV", "MISSING", "ING35", "EMPTY"]
+    full, _ = prov.fetch_funds(order, max_workers=2)
+    calls.clear()
+    limited, limited_quotes = prov.fetch_funds(order, max_workers=2, limit=2)
+    check("limit stops fetching once enough symbols resolved",
+          sorted(calls) == ["DIV", "ING35", "MISSING"], f"calls={calls}")
+    check("limit lists the same first funds as a full fetch",
+          [(f.symbol, f.name) for f in limited]
+          == [(f.symbol, f.name) for f in full[:2]])
+    check("limit returns quotes only for listed funds",
+          sorted(limited_quotes) == ["DIV", "ING35"])
+    calls.clear()
+    over, _ = prov.fetch_funds(order, max_workers=2, limit=10)
+    check("limit above the resolvable count fetches everything",
+          len(over) == 3 and sorted(calls) == sorted(order))
+    calls.clear()
+    named_div = AnalizyProvider.parse_payload(DIVIDEND_PAYLOAD)
+    named_div.attrs["name"] = "Cached DIV"
+    from_cache, _ = prov.fetch_funds(order, max_workers=2, limit=1,
+                                     cached={"DIV": named_div}.get)
+    check("a cached fund counts toward the limit without a request",
+          calls == [] and [f.symbol for f in from_cache] == ["DIV"], f"calls={calls}")
+
     print()
     if failures:
         print(f"PROVIDER TESTS: {failures} failed")

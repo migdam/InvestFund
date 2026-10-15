@@ -1922,8 +1922,12 @@ def main():
             # At most one request per symbol (none if its quotes and name are
             # freshly cached), at most --workers at a time; the analysis reuses
             # these quotes instead of fetching again.
+            if 0 < args.max_funds < len(symbols):
+                print(f"--max-funds {args.max_funds}: checking symbols in order until "
+                      f"{args.max_funds} resolve.", file=sys.stderr)
             funds, quotes = provider.fetch_funds(symbols, max_workers=args.workers,
-                                                 cached=analyzer.cached_quotes)
+                                                 cached=analyzer.cached_quotes,
+                                                 limit=args.max_funds)
             analyzer.quote_source = _NamedSource(
                 lambda s: quotes[s] if s in quotes else provider.download_quotes(s),
                 provider.name,

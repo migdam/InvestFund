@@ -232,7 +232,7 @@ class AnalizyProvider(DataProvider):
             funds.append(FundInfo(symbol=symbol, name=name))
         return funds
 
-    def fetch_funds(self, symbols, max_workers: int = 10, cached=None):
+    def fetch_funds(self, symbols, max_workers: int = 10, cached=None, limit: int = 0):
         """
         Fetch each symbol once; return the fund list and the parsed quotes.
 
@@ -249,6 +249,10 @@ class AnalizyProvider(DataProvider):
             cached quotes (e.g. ``FundAnalyzer.cached_quotes``). Fetched quotes
             record the fund's name in ``df.attrs["name"]`` so it is cached with
             them; a cached entry with a name is listed without a request.
+        limit : int
+            Stop once this many symbols have resolved (0 = no limit). Symbols
+            are fetched in input order, so the result equals the first
+            ``limit`` resolved symbols of a full fetch, with fewer requests.
 
         Returns
         -------
@@ -270,8 +274,19 @@ class AnalizyProvider(DataProvider):
             return name, df
 
         symbols = list(symbols)
+        fetched = []
         with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
-            fetched = list(pool.map(fetch, symbols))
+            # Fetch the shortest prefix of `symbols` holding `limit` resolved
+            # ones: request as many as are still missing, repeat on failures.
+            # Since it is a prefix, the funds listed are exactly the first
+            # `limit` that resolve, as if every symbol had been fetched.
+            while len(fetched) < len(symbols):
+                resolved = sum(r is not None for r in fetched)
+                if limit and resolved >= limit:
+                    break
+                need = (limit - resolved) if limit else len(symbols)
+                batch = symbols[len(fetched):len(fetched) + need]
+                fetched.extend(pool.map(fetch, batch))
 
         funds, quotes = [], {}
         for symbol, result in zip(symbols, fetched):
