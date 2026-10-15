@@ -882,7 +882,7 @@ def run_tests():
         results.add("Load Portfolio JSON/CSV", False, str(e), time.time()-start)
 
     # ========================================================================
-    # Test 36: Optional libraries are not imported with the module
+    # Test 36: Heavy libraries are not imported with the module
     # ========================================================================
     start = time.time()
     try:
@@ -890,15 +890,49 @@ def run_tests():
         probe = subprocess.run(
             [sys.executable, "-c",
              "import sys, analyze_polish_funds; "
-             "print(sorted(m for m in ('matplotlib.pyplot', 'seaborn', 'bs4') if m in sys.modules))"],
+             "print(sorted(m for m in ('matplotlib.pyplot', 'seaborn', 'bs4', 'scipy.stats') "
+             "if m in sys.modules))"],
             cwd=str(Path(__file__).parent), capture_output=True, text=True, timeout=120,
         )
         loaded = probe.stdout.strip()
         assert probe.returncode == 0, probe.stderr[-500:]
         assert loaded == "[]", f"loaded at import: {loaded}"
-        results.add("Optional libraries load lazily", True, duration=time.time()-start)
+        results.add("Heavy libraries load lazily", True, duration=time.time()-start)
     except Exception as e:
-        results.add("Optional libraries load lazily", False, str(e), time.time()-start)
+        results.add("Heavy libraries load lazily", False, str(e), time.time()-start)
+
+    # ========================================================================
+    # Test 37: NumPy statistics are bit-identical to scipy.stats
+    # ========================================================================
+    start = time.time()
+    try:
+        from scipy import stats as scipy_stats
+        from analyze_polish_funds import _skew_kurtosis, _percentile_rank
+
+        def same(a, b):
+            return (np.isnan(a) and np.isnan(b)) or a == b
+
+        samples = []
+        for seed in range(40):
+            r = np.random.default_rng(seed)
+            n = int(r.integers(29, 3000))
+            samples.append(r.normal(0.0003, 0.01, n) if seed % 2 else r.standard_t(3, n) * 0.01)
+        samples += [np.full(50, 0.001), np.zeros(40)]  # constant data -> NaN
+        for x in samples:
+            sk, ku = _skew_kurtosis(pd.Series(x))
+            assert same(sk, scipy_stats.skew(x)), f"skew differs for n={len(x)}"
+            assert same(ku, scipy_stats.kurtosis(x)), f"kurtosis differs for n={len(x)}"
+
+        for seed in range(40):
+            r = np.random.default_rng(seed)
+            scores = list(np.round(r.uniform(0, 100, int(r.integers(1, 40))), 0))  # ties
+            for score in scores[:5] + [0.0, 50.0, 100.0]:
+                assert same(_percentile_rank(scores, score),
+                            scipy_stats.percentileofscore(scores, score)), "percentile differs"
+        assert np.isnan(_percentile_rank([], 1.0))
+        results.add("NumPy statistics match scipy exactly", True, duration=time.time()-start)
+    except Exception as e:
+        results.add("NumPy statistics match scipy exactly", False, str(e), time.time()-start)
 
     # Print summary
     print()

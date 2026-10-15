@@ -5,7 +5,7 @@ reads this file first and appends to it last.
 
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
-- **Iterations logged:** 5
+- **Iterations logged:** 6
 
 ## Summary
 
@@ -36,28 +36,25 @@ analizy.pl costs will differ, but the direction of each change carries over.
 
 ## Backlog
 
-Ordered by expected gain. Each item: evidence, idea, trap.
+Ordered by expected gain. Each item: evidence, idea, trap. After iteration 6 a
+cold run takes about 2.1 s: ~0.5 s startup (pandas, numpy, requests — all
+needed), ~0.2 s network in the mock, then parsing and metrics.
 
-1. **`scipy.stats` is the largest remaining import** (≈0.5 s of the 1.3 s
-   startup; startup is now mostly pandas + scipy). Unlike the plotting
-   libraries it is used on every analysis run (`stats.skew` and
-   `stats.kurtosis` in `calculate_statistics`, `stats.percentileofscore` in
-   `analyze_funds`), so deferring the import only helps `--help` and other
-   non-analysis modes. Computing those three with NumPy instead would help
-   every run. Trap: results must stay within the golden tolerance (1e-9
-   relative) and `percentileofscore`'s default `kind="rank"` tie handling must
-   be reproduced exactly; profile which part of the import cost is
-   `scipy.stats` itself.
+1. **Parsing is now the largest CPU cost** (`parse_ms_per_fund` ≈ 7.4 ms, ≈0.29 s
+   per 39-fund run, ~14% of a cold run). It includes the JSON decode (done by
+   `requests`) and `parse_payload`, which builds a list of tuples, then a
+   DataFrame, then lets `pd.to_datetime` infer the date format. Ideas: build
+   the columns directly; give `pd.to_datetime` an explicit format. Trap:
+   malformed dates must still become NaT and be dropped exactly as now; check
+   which share of the time is JSON decoding before optimizing the rest (a
+   faster JSON library would be a new dependency — Needs approval).
 2. **Daily returns recomputed about six times per fund**: 225 `pct_change`
-   calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown;
-   `calculate_statistics` (scipy skew/kurtosis) is about 28% of compute time.
-   Idea: compute returns once per fund and pass them in. Trap: results must
-   stay within the golden tolerance (1e-9 relative), so keep the same pandas
-   and scipy operations, just do them once.
-3. **`parse_payload` builds a list of tuples, then a DataFrame** (8.7 ms per
-   fund). Build the columns directly. Lower priority: parse plus compute is
-   about 15 ms per fund against about 100 ms of network per fund in the mock.
-4. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
+   calls for 38 funds; `calculate_calmar_ratio` recomputes the max drawdown.
+   `compute_ms_per_fund` is now ≈3.9 ms (≈0.15 s per run, ~7%). Idea: compute
+   returns once per fund and pass them in. Trap: results must stay within the
+   golden tolerance (1e-9 relative), so keep the same pandas operations, just
+   do them once.
+3. **Warm runs read each cache file twice**: `fetch_funds` loads the pickle to
    get the name, then `download_quotes` loads it again for the analysis
    (39 extra loads per warm run). Not measured yet; likely small.
 
@@ -198,3 +195,31 @@ Verdict: KEEP (improved: cli_startup_s, e2e_cold_s, e2e_cold_cpu_s, e2e_cold_rss
 | `e2e_warm_s` | 2.77 s | 2.12 s | −23.6% |
 
 Golden outputs: PASS (both). Commit: `perf: import plotting libraries and bs4 only where used`
+
+### Iteration 6 — 2026-10-15 — KEPT
+Hypothesis: `scipy.stats` added ≈0.7–0.86 s of import (wall clock, on top of
+what the CLI already loads) to every run for three functions. Replacing
+`skew`, `kurtosis` and `percentileofscore` with NumPy code that repeats scipy
+1.17's operations and dropping the import should cut `cli_startup_s` by ~40%
+and cold and warm runs by ~0.6 s (~20–25%), with bit-identical outputs.
+Prototype before editing: bit-identical to scipy on 202 skew/kurtosis cases
+(sizes 29–5000, normal, heavy-tailed, lognormal, real-shaped returns, constant
+and all-zero series) and 3,681 percentile cases (with ties).
+Change: `_skew_kurtosis` and `_percentile_rank` in `analyze_polish_funds.py`
+replace the three scipy calls; the module no longer imports scipy. scipy stays
+in requirements.txt (the dashboard and doctor use it). New test in
+`test_with_mocks.py` asserts exact equality with scipy; computing m3 as `d**3`
+instead of scipy's `d**2 * d` fails it (checked). The import guard now covers
+`scipy.stats`. scipy's "precision loss" RuntimeWarning for nearly constant data
+is no longer printed (console only).
+Verdict: KEEP (improved: cli_startup_s, e2e_cold_s, e2e_cold_cpu_s, e2e_cold_rss_mb, e2e_warm_s)
+
+| metric | before | after | change |
+|---|---|---|---|
+| `cli_startup_s` | 1.28 s | 0.54 s | −57.8% |
+| `e2e_cold_s` | 3.05 s | 2.07 s | −32.2% |
+| `e2e_cold_cpu_s` | 3.36 s | 2.24 s | −33.6% |
+| `e2e_cold_rss_mb` | 213 MB | 158 MB | −25.9% |
+| `e2e_warm_s` | 2.29 s | 1.31 s | −42.9% |
+
+Golden outputs: PASS (both). Commit: `perf: compute skew, kurtosis and percentile ranks without scipy`

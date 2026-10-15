@@ -48,8 +48,36 @@ from io import StringIO
 import numpy as np
 import pandas as pd
 import requests
-from scipy import stats
 from tqdm import tqdm
+
+
+# The next two functions repeat scipy.stats 1.17 (skew, kurtosis and
+# percentileofscore with their defaults) operation by operation, so results are
+# bit-identical, without importing scipy.stats on every run (about 0.7 s).
+# test_with_mocks.py compares them with scipy.
+
+def _skew_kurtosis(values) -> Tuple[float, float]:
+    """scipy.stats.skew(x) and scipy.stats.kurtosis(x): biased, Fisher kurtosis."""
+    x = np.asarray(values, dtype=float)
+    mean = np.mean(x, axis=0, keepdims=True)
+    d = x - mean
+    m2 = np.mean(d ** 2, axis=0)
+    m3 = np.mean(d ** 2 * d, axis=0)
+    m4 = np.mean((d ** 2) ** 2, axis=0)
+    if m2 <= (np.finfo(m2.dtype).eps * mean[0]) ** 2:  # (near-)constant data
+        return np.nan, np.nan
+    return m3 / m2 ** 1.5, m4 / m2 ** 2.0 - 3
+
+
+def _percentile_rank(scores, score) -> float:
+    """scipy.stats.percentileofscore(scores, score) with kind='rank'."""
+    a = np.asarray(scores, dtype=float)
+    n = len(a)
+    if n == 0 or np.isnan(a).any() or np.isnan(score):
+        return np.nan
+    left = np.count_nonzero(a < score)
+    right = np.count_nonzero(a <= score)
+    return (left + right + (left < right)) * (50.0 / n)
 
 
 def _plotting_libs():
@@ -687,9 +715,10 @@ class FundAnalyzer:
 
         returns = df["Close"].pct_change().dropna()
 
+        skewness, kurtosis = _skew_kurtosis(returns)
         return {
-            "skewness": stats.skew(returns),
-            "kurtosis": stats.kurtosis(returns)
+            "skewness": skewness,
+            "kurtosis": kurtosis
         }
 
     def calculate_benchmark_metrics(
@@ -1263,7 +1292,7 @@ class FundAnalyzer:
         if results:
             scores = [m.score for m in results]
             for metrics in results:
-                metrics.percentile_rank = stats.percentileofscore(scores, metrics.score)
+                metrics.percentile_rank = _percentile_rank(scores, metrics.score)
 
         return results
 
