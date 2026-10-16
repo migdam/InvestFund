@@ -41,7 +41,7 @@ jobs:
       - name: Code-quality tests
         run: python test_code_quality.py
 
-      - name: Dashboard smoke tests
+      - name: Dashboard tests (live path against the offline mock)
         run: python test_dashboard.py
 
       - name: Module tests (rebalancing, alerts, metrics, workflow, providers, build-map)
@@ -53,7 +53,7 @@ jobs:
           python test_providers.py
           python test_build_map.py
 
-      - name: Golden-output check (offline mock of analizy.pl)
+      - name: Golden-output check (offline mock of analizy.pl; CLI and dashboard)
         run: python bench/bench.py --golden-only
 
   lint:

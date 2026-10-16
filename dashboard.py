@@ -4,15 +4,18 @@ dashboard.py
 
 Interactive Streamlit dashboard for the Polish Funds Analyzer.
 
-It wraps the :class:`FundAnalyzer` from ``analyze_polish_funds`` to provide:
+It wraps the analyzer in ``analyze_polish_funds`` to provide:
 
-- **Fund Screener** — run the analysis, filter/sort results, view charts,
-  optional benchmark-relative metrics and a correlation heatmap, download data.
+- **Fund Screener** — screen funds with live data, filter/sort the results,
+  view charts, add optional benchmark-relative metrics, download data.
 - **Portfolio Tracker** — load a holdings file, see value/P&L/allocation, and a
   fee-drag projection.
 
-A **Demo mode** generates synthetic data so the UI is fully usable without any
-network access (handy for trying it out or when Stooq is unreachable).
+Data sources: **analizy.pl** (Polish TFI funds, the default), **Stooq** (needs
+an API key) and, for the screener, **Demo**, which generates synthetic funds so
+the UI works without network access. Live screening runs the CLI's own code
+(``screen_funds``): each fund is fetched once, in parallel, and cached on disk
+for a day.
 
 Run with::
 
@@ -27,19 +30,44 @@ investment advice.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from analyze_polish_funds import FundAnalyzer, FundMetrics
+from analyze_polish_funds import (
+    STOOQ_APIKEY_ENV,
+    FundAnalyzer,
+    FundMetrics,
+    _percentile_rank,
+    build_quote_source,
+    load_symbols_file,
+    parse_symbols,
+    prefetch_analizy,
+    screen_funds,
+)
 
 # Percentage-valued columns shared across formatting helpers
 PCT_COLUMNS = [
     "return_1m", "return_3m", "return_6m", "return_1y", "return_ytd",
     "volatility", "max_drawdown", "var_95", "cvar_95",
 ]
+
+# Data sources as offered in the sidebar
+SOURCES = {
+    "analizy": "analizy.pl (Polish TFI funds)",
+    "stooq": "Stooq (needs an API key)",
+    "demo": "Demo (synthetic data)",
+}
+SOURCE_NAMES = {"analizy": "analizy.pl", "stooq": "Stooq"}
+EXAMPLE_SYMBOLS = {"analizy": "ING35", "stooq": "1006.N"}
+
+# The screener starts with these analizy.pl symbols (each verified live)
+DEFAULT_SYMBOLS_FILE = Path(__file__).resolve().with_name("test_symbols_analizy.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -75,43 +103,56 @@ def _demo_screening_results(n: int, seed: int = 42) -> list:
         m.score = score
         results.append(m)
 
-    from scipy import stats as _stats
     scores = [m.score for m in results]
     for m in results:
-        m.percentile_rank = float(_stats.percentileofscore(scores, m.score))
+        m.percentile_rank = _percentile_rank(scores, m.score)
     return results
 
 
-@st.cache_data(show_spinner=False)
-def run_screening(max_funds: int, workers: int, use_cache: bool,
-                  benchmark: str, demo: bool) -> pd.DataFrame:
-    """Run (or simulate) the fund screening and return a summary DataFrame."""
-    analyzer = FundAnalyzer(use_cache=use_cache)
+def run_screening(source: str, symbols: tuple, max_funds: int, workers: int,
+                  use_cache: bool, benchmark: str = "",
+                  stooq_apikey: str = "") -> pd.DataFrame:
+    """
+    Screen funds (or simulate it) and return the summary DataFrame, best first.
 
-    if demo:
+    Live sources run the CLI's ``screen_funds``; an empty ``symbols`` means
+    Stooq's listing page. Not memoized: the results stay in session state, so
+    this runs only when asked to, and the disk cache already spares repeat
+    downloads for a day.
+    """
+    if source == "demo":
         results = _demo_screening_results(max_funds if max_funds > 0 else 30)
-        return analyzer.create_summary_dataframe(results)
+        return FundAnalyzer(use_cache=False).create_summary_dataframe(results)
 
+    analyzer = FundAnalyzer(use_cache=use_cache, quote_source=build_quote_source(source),
+                            stooq_apikey=stooq_apikey or None)
     if benchmark:
         analyzer.set_benchmark(benchmark)
-    funds = analyzer.get_fund_list()
-    if max_funds > 0:
-        funds = funds[:max_funds]
-    results = analyzer.analyze_funds(funds, max_workers=workers)
+    results = screen_funds(analyzer, source, list(symbols) or None, max_funds, workers)
+    if not results:
+        return pd.DataFrame()
     return analyzer.create_summary_dataframe(results)
 
 
-@st.cache_data(show_spinner=False)
-def run_portfolio(file_bytes: bytes, filename: str, use_cache: bool) -> tuple:
+# Memoized because the portfolio view recomputes on every rerun (each slider
+# move); the TTL lets a long-running dashboard pick up new prices.
+@st.cache_data(show_spinner=False, ttl=3600)
+def run_portfolio(file_bytes: bytes, filename: str, source: str = "analizy",
+                  use_cache: bool = True, stooq_apikey: str = "") -> tuple:
     """Value a portfolio from uploaded holdings file bytes."""
-    analyzer = FundAnalyzer(use_cache=use_cache)
+    analyzer = FundAnalyzer(use_cache=use_cache, quote_source=build_quote_source(source),
+                            stooq_apikey=stooq_apikey or None)
 
+    # load_portfolio reads a path and picks the format from its suffix
     suffix = ".json" if filename.lower().endswith(".json") else ".csv"
-    tmp_path = f".portfolio_upload{suffix}"
-    with open(tmp_path, "wb") as f:
-        f.write(file_bytes)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / f"holdings{suffix}"
+        path.write_bytes(file_bytes)
+        holdings = analyzer.load_portfolio(str(path))
 
-    holdings = analyzer.load_portfolio(tmp_path)
+    if source == "analizy":
+        # Fetch every holding up front, in parallel, as the CLI does
+        prefetch_analizy(analyzer, dict.fromkeys(h.symbol for h in holdings))
     positions, summary = analyzer.analyze_portfolio(holdings)
     df = pd.DataFrame([asdict(p) for p in positions])
     return df, summary
@@ -120,6 +161,26 @@ def run_portfolio(file_bytes: bytes, filename: str, use_cache: bool) -> tuple:
 def fee_projection(value: float, ter: float, years: int, gross: float) -> dict:
     """Thin wrapper around FundAnalyzer.project_fee_drag for caching-free calls."""
     return FundAnalyzer.project_fee_drag(value, ter, years, gross)
+
+
+def _default_symbols(source: str) -> str:
+    """Initial content of the symbols box: the verified analizy.pl list."""
+    if source == "analizy" and DEFAULT_SYMBOLS_FILE.exists():
+        return "\n".join(load_symbols_file(str(DEFAULT_SYMBOLS_FILE)))
+    return ""
+
+
+def _fill_symbols_from_upload(upload_key: str, box_key: str) -> None:
+    """file_uploader callback: replace the symbols box with the file's symbols."""
+    uploaded = st.session_state.get(upload_key)
+    if uploaded is None:
+        return
+    try:
+        symbols = parse_symbols(uploaded.getvalue().decode("utf-8-sig"))
+    except ValueError as exc:  # bad JSON or not text
+        st.session_state[f"{upload_key}_error"] = f"Could not read {uploaded.name}: {exc}"
+        return
+    st.session_state[box_key] = "\n".join(symbols)
 
 
 # ---------------------------------------------------------------------------
@@ -148,41 +209,125 @@ def format_display(df: pd.DataFrame) -> pd.DataFrame:
 # Views
 # ---------------------------------------------------------------------------
 
+def _stooq_apikey_input(key: str) -> str:
+    """Password box for the Stooq API key (empty: the STOOQ_APIKEY env var)."""
+    apikey = st.text_input(
+        "Stooq API key", type="password", key=key,
+        help="Stooq's CSV downloads need a key (one-time captcha at "
+             "https://stooq.pl/q/d/?s=wig&get_apikey). Leave empty to use "
+             f"the {STOOQ_APIKEY_ENV} environment variable.")
+    if not apikey.strip() and not os.environ.get(STOOQ_APIKEY_ENV):
+        st.caption("No API key set: Stooq will refuse the downloads.")
+    return apikey.strip()
+
+
+def _symbols_input(source: str) -> list:
+    """Symbols box plus file upload for a live source; returns the symbols."""
+    box_key, upload_key = f"symbols_{source}", f"symbols_file_{source}"
+    if box_key not in st.session_state:
+        st.session_state[box_key] = _default_symbols(source)
+    hint = "" if source == "analizy" else " Leave empty to use Stooq's fund listing."
+    st.text_area("Fund symbols", key=box_key, height=160,
+                 help=f"One per line, e.g. {EXAMPLE_SYMBOLS[source]}; lines starting "
+                      f"with # are ignored.{hint}")
+    st.file_uploader("…or load them from a file", type=["txt", "json"], key=upload_key,
+                     on_change=_fill_symbols_from_upload, args=(upload_key, box_key),
+                     help="One symbol per line or a JSON list, as for the CLI's "
+                          "--symbols-file.")
+    error = st.session_state.pop(f"{upload_key}_error", None)
+    if error:
+        st.error(error)
+    try:
+        # Each symbol once, in the order given
+        return list(dict.fromkeys(parse_symbols(st.session_state[box_key])))
+    except ValueError as exc:
+        st.error(f"Could not read the symbols: {exc}")
+        return []
+
+
+def _report_missing(df: pd.DataFrame, run: dict) -> None:
+    """Name the requested symbols that are not in the results."""
+    symbols, limit = run["symbols"], run["max_funds"]
+    analyzed = set(df["symbol"]) if not df.empty else set()
+    tried = symbols
+    if 0 < limit < len(symbols):
+        # Symbols are fetched in order until `limit` resolve: every one before
+        # the last analyzed symbol was tried, later ones perhaps not.
+        last = max((symbols.index(s) for s in analyzed), default=-1)
+        tried = symbols[:last + 1]
+        st.caption(f"Max funds is {limit}: symbols were checked in order until "
+                   f"{limit} resolved; later ones were not requested.")
+    missing = [s for s in tried if s not in analyzed]
+    if missing:
+        st.warning(f"No results for {len(missing)} symbol(s): {', '.join(missing)} "
+                   "(unknown symbol, failed download, or fewer than 20 quotes).")
+
+
 def render_screener():
     st.header("📊 Fund Screener")
 
     with st.sidebar:
         st.subheader("Screening settings")
-        demo = st.toggle("Demo mode (synthetic data)", value=True,
-                         help="Generate synthetic funds so the dashboard works "
-                              "without network access.")
-        max_funds = st.number_input("Max funds (0 = all)", min_value=0, value=30, step=10)
-        workers = st.slider("Parallel workers", 1, 20, 10, disabled=demo)
-        benchmark = st.text_input("Benchmark ticker (optional)", value="",
-                                  disabled=demo,
-                                  help="e.g. 'wig' to add beta/alpha/etc.")
-        use_cache = st.checkbox("Use cache", value=True, disabled=demo)
-        run = st.button("Run analysis", type="primary")
+        source = st.radio("Data source", list(SOURCES), format_func=SOURCES.get,
+                          key="source")
+        live = source != "demo"
+        apikey, symbols = "", []
+        if source == "stooq":
+            apikey = _stooq_apikey_input("stooq_apikey")
+        if live:
+            symbols = _symbols_input(source)
+        max_funds = st.number_input("Max funds (0 = all)", min_value=0, value=30, step=10,
+                                    key="max_funds")
+        workers = st.slider("Parallel workers", 1, 20, 10, disabled=not live,
+                            help="At most this many downloads at a time.")
+        benchmark = st.text_input("Benchmark (optional)", value="", disabled=not live,
+                                  help="A fund or index from the same data source "
+                                       "(analizy.pl: a fund code; Stooq: e.g. 'wig'). "
+                                       "Adds beta, alpha and other relative metrics.")
+        use_cache = st.checkbox("Use cache", value=True, disabled=not live,
+                                help="Reuse quotes downloaded in the last 24 hours.")
+        run = st.button("Run analysis", type="primary", key="run_screen")
+    # What the results depend on (workers and cache only change the speed)
+    settings = (source, tuple(symbols), int(max_funds), benchmark.strip())
 
-    if run or "screen_df" not in st.session_state:
-        with st.spinner("Analyzing funds…"):
+    # Demo data is generated locally, so it is shown right away; live data is
+    # downloaded only when asked for.
+    if run or (not live and "screen_df" not in st.session_state):
+        if source == "analizy" and not symbols:
+            st.warning("Enter at least one analizy.pl fund symbol in the sidebar.")
+            return
+        label = (f"Fetching quotes from {SOURCE_NAMES[source]} and analyzing…" if live
+                 else "Generating demo data…")
+        with st.spinner(label):
             try:
-                st.session_state.screen_df = run_screening(
-                    int(max_funds), int(workers), bool(use_cache),
-                    benchmark.strip(), bool(demo),
-                )
-                st.session_state.screen_demo = demo
+                df = run_screening(source, tuple(symbols), int(max_funds), int(workers),
+                                   bool(use_cache), benchmark.strip(), apikey)
             except Exception as exc:  # network/parse failures shouldn't crash UI
                 st.error(f"Analysis failed: {exc}")
                 return
+        st.session_state.screen_df = df
+        st.session_state.screen_run = {"source": source, "symbols": symbols,
+                                       "max_funds": int(max_funds), "settings": settings}
 
-    df = st.session_state.get("screen_df")
-    if df is None or df.empty:
-        st.info("No results. Adjust settings and run the analysis.")
+    if "screen_df" not in st.session_state:
+        st.info(f"Check the fund symbols in the sidebar, then press **Run analysis** "
+                f"to fetch live data from {SOURCE_NAMES[source]}.")
         return
 
-    if st.session_state.get("screen_demo"):
-        st.caption("⚠️ Showing **synthetic demo data** — turn off Demo mode for live Stooq data.")
+    df = st.session_state.screen_df
+    shown = st.session_state.screen_run
+    if shown["source"] == "demo":
+        st.caption("⚠️ Showing **synthetic demo data** — choose analizy.pl as the "
+                   "data source for live data.")
+    else:
+        st.caption(f"Live data from {SOURCE_NAMES[shown['source']]}.")
+        _report_missing(df, shown)
+    if shown["settings"] != settings:
+        st.info("Settings changed: press **Run analysis** to update these results.")
+
+    if df.empty:
+        st.info("No results. Adjust settings and run the analysis.")
+        return
 
     # Summary metric cards
     c1, c2, c3, c4 = st.columns(4)
@@ -244,12 +389,16 @@ def render_portfolio():
 
     with st.sidebar:
         st.subheader("Portfolio settings")
+        source = st.radio("Price source", ["analizy", "stooq"], format_func=SOURCES.get,
+                          key="pf_source")
+        apikey = _stooq_apikey_input("pf_apikey") if source == "stooq" else ""
         use_cache = st.checkbox("Use cache", value=True, key="pf_cache")
         years = st.slider("Projection horizon (years)", 1, 40, 10)
         gross = st.slider("Assumed gross annual return", 0.0, 0.15, 0.06, 0.01)
 
     st.write("Upload a holdings file (JSON or CSV with "
-             "`symbol, shares, cost_basis[, ter, name]`).")
+             "`symbol, shares, cost_basis[, ter, name]`), using "
+             f"{SOURCE_NAMES[source]} symbols such as `{EXAMPLE_SYMBOLS[source]}`.")
     uploaded = st.file_uploader("Holdings file", type=["json", "csv"])
 
     if uploaded is None:
@@ -258,16 +407,23 @@ def render_portfolio():
         return
 
     try:
-        df, summary = run_portfolio(uploaded.getvalue(), uploaded.name, bool(use_cache))
+        with st.spinner(f"Fetching prices from {SOURCE_NAMES[source]}…"):
+            df, summary = run_portfolio(uploaded.getvalue(), uploaded.name, source=source,
+                                        use_cache=bool(use_cache), stooq_apikey=apikey)
     except Exception as exc:
         st.error(f"Could not process portfolio: {exc}")
         return
 
     if summary["num_priced"] == 0:
-        st.warning("None of the holdings could be priced (network blocked or "
-                   "unknown tickers). Showing holdings without valuation.")
+        st.warning(f"None of the holdings could be priced from {SOURCE_NAMES[source]} "
+                   "(network blocked or unknown symbols). Showing holdings without "
+                   "valuation.")
         st.dataframe(df, width='stretch', hide_index=True)
         return
+    unpriced = list(dict.fromkeys(df.loc[df["current_value"].isna(), "symbol"]))
+    if unpriced:
+        st.warning(f"No price from {SOURCE_NAMES[source]} for: {', '.join(unpriced)} "
+                   "(excluded from the totals).")
 
     # Metric cards
     c1, c2, c3, c4 = st.columns(4)

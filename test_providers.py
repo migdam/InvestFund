@@ -350,6 +350,104 @@ def run() -> int:
         check("an unknown symbol still returns None",
               live._fetch_json("MISSING01") is None)
 
+    # 17. prefetch_analizy: one request per symbol, then the analyzer answers
+    #     from those responses; a symbol that failed is not requested again.
+    import contextlib
+    import io
+    import json
+    from analyze_polish_funds import (FundInfo, build_parser, build_quote_source,
+                                      prefetch_analizy, run_portfolio, screen_funds)
+
+    def analizy_analyzer():
+        return FundAnalyzer(use_cache=False, quote_source=build_quote_source("analizy"))
+
+    lengths = dict(mock_analizy.UNIVERSE)
+    original_url = AnalizyProvider.BASE_URL
+    quiet = contextlib.redirect_stderr(io.StringIO())
+    with mock_analizy.MockAnalizyServer(connect_latency=0, request_latency=0) as server, quiet:
+        AnalizyProvider.BASE_URL = server.url_template
+        try:
+            analyzer = analizy_analyzer()
+            funds = prefetch_analizy(analyzer, ["BENCH00", "MISSING01", "BENCH01"], workers=2)
+            check("prefetch lists resolved symbols in order, named by analizy.pl",
+                  [(f.symbol, f.name) for f in funds]
+                  == [("BENCH00", "Fundusz Testowy Spółek BENCH00"),
+                      ("BENCH01", "Fundusz Testowy Spółek BENCH01")])
+            check("prefetch requests each symbol once", server.stats.requests == 3,
+                  f"requests={server.stats.requests}")
+            server.stats.reset()
+            df = analyzer.download_quotes("BENCH00")
+            check("prefetched quotes are served without a request",
+                  df is not None and len(df) == lengths["BENCH00"]
+                  and server.stats.requests == 0, f"requests={server.stats.requests}")
+            check("a prefetched failure is not requested again",
+                  analyzer.download_quotes("MISSING01") is None and server.stats.requests == 0,
+                  f"requests={server.stats.requests}")
+            check("a symbol outside the prefetch is downloaded on demand",
+                  analyzer.download_quotes("BENCH02") is not None and server.stats.requests == 1)
+            check("the prefetching source keeps the analizy cache tag",
+                  analyzer.quote_source.name == "analizy")
+            server.stats.reset()
+            limited = analizy_analyzer()
+            funds = prefetch_analizy(limited, ["BENCH00", "MISSING01", "BENCH01"], workers=2,
+                                     limit=1)
+            check("prefetch with a limit stops once enough symbols resolved",
+                  [f.symbol for f in funds] == ["BENCH00"] and server.stats.requests == 1,
+                  f"requests={server.stats.requests}")
+            check("with a limit, symbols not yet tried are downloaded on demand",
+                  limited.download_quotes("BENCH01") is not None and server.stats.requests == 2)
+
+            # 18. screen_funds: the screening run behind the CLI and the dashboard
+            try:
+                screen_funds(analizy_analyzer(), "analizy")
+                raised = False
+            except ValueError:
+                raised = True
+            check("screen_funds needs symbols for analizy", raised)
+            server.stats.reset()
+            results = screen_funds(analizy_analyzer(), "analizy",
+                                   ["MISSING01", "SHORT15", "BENCH00", "BENCH01", "BENCH02"],
+                                   max_funds=3, workers=2)
+            check("screen_funds analyzes the first max_funds symbols that resolve",
+                  sorted(m.symbol for m in results) == ["BENCH00", "BENCH01"]
+                  and server.stats.requests == 4, f"requests={server.stats.requests}")
+            check("screen_funds scores and ranks the results",
+                  all(m.recommendation and m.percentile_rank is not None for m in results))
+            stub = {s: AnalizyProvider.parse_payload(mock_analizy.make_payload(s, 400))
+                    for s in ("A1", "B2", "C3")}
+            results = screen_funds(FundAnalyzer(use_cache=False, quote_source=stub.get),
+                                   "stooq", ["A1", "B2", "C3"], max_funds=2, workers=2)
+            check("screen_funds names explicit Stooq symbols after themselves",
+                  sorted((m.symbol, m.name) for m in results) == [("A1", "A1"), ("B2", "B2")])
+            listed = FundAnalyzer(use_cache=False, quote_source=stub.get)
+            listed.get_fund_list = lambda: [FundInfo("C3", "Listed C3")]
+            results = screen_funds(listed, "stooq")
+            check("screen_funds without symbols uses the Stooq listing",
+                  [(m.symbol, m.name) for m in results] == [("C3", "Listed C3")])
+
+            # 19. The CLI's portfolio mode prefetches analizy holdings: one
+            #     request per symbol even with repeated lots and no cache.
+            with tempfile.TemporaryDirectory() as tmp:
+                holdings_path = _Path(tmp) / "holdings.json"
+                holdings_path.write_text(json.dumps({"holdings": [
+                    {"symbol": "BENCH03", "shares": 1, "cost_basis": 100},
+                    {"symbol": "MISSING01", "shares": 1, "cost_basis": 10},
+                    {"symbol": "BENCH03", "shares": 2, "cost_basis": 90},
+                    {"symbol": "MISSING01", "shares": 1, "cost_basis": 10},
+                ]}))
+                args = build_parser().parse_args([
+                    "--provider", "analizy", "--portfolio", str(holdings_path), "--no-cache",
+                    "--format", "csv", "--output", str(_Path(tmp) / "portfolio")])
+                server.stats.reset()
+                run_portfolio(args)
+                out = pd.read_csv(_Path(tmp) / "portfolio.csv")
+            check("CLI portfolio requests each holding's symbol once",
+                  server.stats.requests == 2, f"requests={server.stats.requests}")
+            check("CLI portfolio values the lots it could price",
+                  len(out) == 4 and out["current_value"].notna().sum() == 2)
+        finally:
+            AnalizyProvider.BASE_URL = original_url
+
     print()
     if failures:
         print(f"PROVIDER TESTS: {failures} failed")

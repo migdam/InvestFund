@@ -19,9 +19,10 @@ everything is measured against a local mock of its API.
 
 ## Goal
 
-Make the analizy.pl screening path (`--provider analizy --symbols-file …`)
-cheaper — fewer requests and connections, less wall time, CPU, memory and
-startup time — **without changing any output**. Progress is whatever
+Make the analizy.pl screening path (`--provider analizy --symbols-file …`, and
+the dashboard's live screening, which runs the same `screen_funds`) cheaper —
+fewer requests and connections, less wall time, CPU, memory and startup time —
+**without changing any output**. Progress is whatever
 `bench/bench.py` measures, nothing else. "Most efficient in the world" is not
 a claim this loop can check, so it never makes it: it optimizes this benchmark
 until the gains run out and reports raw numbers.
@@ -53,10 +54,12 @@ report why (see Finish).
 7. **One idea per iteration**, the smallest diff that tests it. No new
    dependencies: list such ideas under *Needs approval*.
 8. **Only optimize what the benchmark exercises:** CLI startup, symbol
-   discovery, download, parsing, metrics, CSV export on the analizy path.
-   Stooq (needs an API key), the dashboard, plots, portfolio, correlation and
-   the HTML/Excel/JSON exporters are out of scope, because their effect cannot
-   be measured or golden-checked here.
+   discovery, download, parsing, metrics, CSV export on the analizy path, and
+   the dashboard's live analizy.pl screening run (`ui_cold_s`; the user added
+   this scenario on 2026-10-16). Stooq (needs an API key), the dashboard's
+   other views and Demo mode, plots, portfolio, correlation and the
+   HTML/Excel/JSON exporters are out of scope, because their effect cannot be
+   measured or golden-checked here.
 9. **The verdict decides.** Never keep a change the benchmark did not mark
    KEEP. You may still revert a KEEP you judge unsafe.
 
@@ -158,7 +161,7 @@ there is nothing external to wait for. If a stop condition now holds, go to
 
 - three iterations in a row ended in REVERT;
 - the backlog is empty and a fresh profile shows nothing worth at least 5% of
-  `e2e_cold_s` or 15% of `cli_startup_s`;
+  `e2e_cold_s` or `ui_cold_s`, or 15% of `cli_startup_s`;
 - 15 iterations have been logged;
 - progress would require breaking a rule;
 - tests or the golden check fail on a clean HEAD.

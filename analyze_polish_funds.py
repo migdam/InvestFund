@@ -1625,6 +1625,10 @@ def run_portfolio(args):
         return
 
     print(f"Valuing {len(holdings)} holding(s)…", file=sys.stderr)
+    if getattr(args, "provider", "stooq") == "analizy":
+        # Fetch every holding up front, at most --workers at a time, instead
+        # of one after another during the valuation.
+        prefetch_analizy(analyzer, dict.fromkeys(h.symbol for h in holdings), args.workers)
     positions, summary = analyzer.analyze_portfolio(holdings)
 
     # Build a DataFrame and export in the requested formats
@@ -1843,11 +1847,18 @@ Examples:
 
 
 def load_symbols_file(path: str) -> list:
+    """Load fund symbols from a file (format as for :func:`parse_symbols`)."""
+    # utf-8-sig: a byte-order mark (as Windows Notepad writes) would otherwise
+    # become part of the first symbol.
+    return parse_symbols(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def parse_symbols(text: str) -> list:
     """
-    Load fund symbols from a file: either a JSON array, or plain text with one
-    symbol per line (``#`` comments and blank lines ignored).
+    Parse fund symbols: either a JSON array, or plain text with one symbol per
+    line (``#`` comments and blank lines ignored).
     """
-    text = Path(path).read_text(encoding="utf-8").strip()
+    text = text.strip()
     if not text:
         return []
     if text[0] == "[":
@@ -1890,6 +1901,98 @@ class _NamedSource:
 
     def __call__(self, symbol):
         return self._fn(symbol)
+
+
+def prefetch_analizy(analyzer: FundAnalyzer, symbols, workers: int = 10,
+                     limit: int = 0) -> List[FundInfo]:
+    """
+    Fetch analizy.pl funds up front and make ``analyzer`` serve their quotes.
+
+    Each symbol is requested at most once (not at all if its quotes and name
+    are freshly cached), at most ``workers`` at a time, stopping once ``limit``
+    symbols have resolved (0 = no limit). Afterwards ``analyzer`` answers from
+    these responses; without a limit every symbol has been tried, so one that
+    failed is not requested again.
+
+    ``analyzer`` must have been built with ``build_quote_source("analizy")``,
+    so that the cache lookups read analizy.pl's cache files.
+
+    Returns
+    -------
+    list[FundInfo]
+        The symbols that resolved, in input order, named by analizy.pl.
+    """
+    from providers import AnalizyProvider
+    provider = AnalizyProvider()
+    symbols = list(symbols)
+    funds, quotes = provider.fetch_funds(symbols, max_workers=workers,
+                                         cached=analyzer.cached_quotes, limit=limit)
+    tried = set(quotes) if limit else set(symbols)
+    analyzer.quote_source = _NamedSource(
+        lambda s: quotes.get(s) if s in tried else provider.download_quotes(s),
+        provider.name,
+    )
+    return funds
+
+
+def screen_funds(analyzer: FundAnalyzer, provider: str = "stooq", symbols=None,
+                 max_funds: int = 0, workers: int = 10,
+                 score_weights: Optional[Dict[str, float]] = None) -> List[FundMetrics]:
+    """
+    Find funds and analyze them: the screening run behind the CLI and the dashboard.
+
+    Parameters
+    ----------
+    analyzer : FundAnalyzer
+        Built with ``quote_source=build_quote_source(provider)``; set a
+        benchmark on it first if wanted.
+    provider : str
+        "stooq" or "analizy".
+    symbols : list of str, optional
+        The funds to screen. Without them Stooq's listing page is used;
+        analizy.pl has no listing, so it needs symbols.
+    max_funds : int
+        Analyze at most this many funds (0 = all). With analizy, symbols are
+        fetched in order only until this many have resolved.
+    workers : int
+        At most this many downloads at a time.
+    score_weights : dict, optional
+        Custom scoring weights.
+
+    Raises
+    ------
+    ValueError
+        provider "analizy" without symbols.
+    RuntimeError
+        Stooq's listing page could not be read.
+    """
+    if symbols is not None and provider == "analizy":
+        # At most one request per symbol (none if its quotes and name are
+        # freshly cached), at most `workers` at a time; the analysis reuses
+        # these quotes instead of fetching again.
+        if 0 < max_funds < len(symbols):
+            print(f"--max-funds {max_funds}: checking symbols in order until "
+                  f"{max_funds} resolve.", file=sys.stderr)
+        funds = prefetch_analizy(analyzer, symbols, workers, limit=max_funds)
+    elif symbols is not None:
+        funds = [FundInfo(symbol=s, name=s) for s in symbols]
+    elif provider == "analizy":
+        raise ValueError("analizy.pl has no fund listing: pass the symbols to screen")
+    else:
+        print("Downloading list of funds…", file=sys.stderr)
+        funds = analyzer.get_fund_list()
+    print(f"Found {len(funds)} funds.", file=sys.stderr)
+
+    if max_funds > 0:
+        funds = funds[:max_funds]
+        print(f"Analyzing first {len(funds)} funds.", file=sys.stderr)
+
+    # With analizy every quote is already downloaded, so the analysis is pure
+    # CPU work: threads only contend for the GIL (about 2.7x slower than one
+    # worker for 38 funds). Stooq still downloads here, so it keeps `workers`.
+    analysis_workers = 1 if provider == "analizy" else workers
+    return analyzer.analyze_funds(funds, max_workers=analysis_workers,
+                                  score_weights=score_weights)
 
 
 def main():
@@ -1947,55 +2050,25 @@ def main():
             print(f"Benchmark '{args.benchmark}' loaded; computing relative metrics.",
                   file=sys.stderr)
 
-    # Get fund list. analizy.pl has no bulk list endpoint, so it requires an
-    # explicit --symbols-file; Stooq uses its built-in listing page.
+    # Symbols to screen. analizy.pl has no bulk list endpoint, so it requires
+    # an explicit --symbols-file; Stooq can fall back to its listing page.
+    symbols = None
     if args.symbols_file:
         symbols = load_symbols_file(args.symbols_file)
         print(f"Loaded {len(symbols)} symbols from {args.symbols_file}", file=sys.stderr)
-        if args.provider == "analizy":
-            from providers import AnalizyProvider
-            provider = AnalizyProvider()
-            # At most one request per symbol (none if its quotes and name are
-            # freshly cached), at most --workers at a time; the analysis reuses
-            # these quotes instead of fetching again.
-            if 0 < args.max_funds < len(symbols):
-                print(f"--max-funds {args.max_funds}: checking symbols in order until "
-                      f"{args.max_funds} resolve.", file=sys.stderr)
-            funds, quotes = provider.fetch_funds(symbols, max_workers=args.workers,
-                                                 cached=analyzer.cached_quotes,
-                                                 limit=args.max_funds)
-            analyzer.quote_source = _NamedSource(
-                lambda s: quotes[s] if s in quotes else provider.download_quotes(s),
-                provider.name,
-            )
-        else:
-            funds = [FundInfo(symbol=s, name=s) for s in symbols]
     elif args.provider == "analizy":
         print("Error: --provider analizy requires --symbols-file (no bulk list "
               "endpoint exists). Provide a text/JSON file of analizy.pl symbols.",
               file=sys.stderr)
         return
-    else:
-        print("Downloading list of funds…", file=sys.stderr)
-        try:
-            funds = analyzer.get_fund_list()
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(1)
-    print(f"Found {len(funds)} funds.", file=sys.stderr)
 
-    # Limit funds if requested
-    if args.max_funds > 0:
-        funds = funds[:args.max_funds]
-        print(f"Analyzing first {len(funds)} funds.", file=sys.stderr)
-
-    # Analyze funds
-    # With analizy every quote is already downloaded, so the analysis is pure
-    # CPU work: threads only contend for the GIL (about 2.7x slower than one
-    # worker for 38 funds). Stooq still downloads here, so it keeps --workers.
-    analysis_workers = 1 if args.provider == "analizy" else args.workers
-    results = analyzer.analyze_funds(funds, max_workers=analysis_workers,
-                                     score_weights=score_weights)
+    # Find and analyze the funds (the dashboard runs the same function)
+    try:
+        results = screen_funds(analyzer, args.provider, symbols, args.max_funds,
+                               args.workers, score_weights)
+    except RuntimeError as exc:  # Stooq's listing page could not be read
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if not results:
         print("No funds were successfully analyzed.", file=sys.stderr)

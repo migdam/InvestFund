@@ -81,15 +81,27 @@ streamlit run dashboard.py
 
 It opens in your browser with two views:
 
-- **Fund Screener** — run the analysis, filter by recommendation and minimum
-  score, sort the table, view risk/return and score charts, and download
-  CSV/JSON. Supports an optional benchmark ticker.
+- **Fund Screener** — screen funds with live data, filter by recommendation and
+  minimum score, sort the table, view risk/return and score charts, and
+  download CSV/JSON. Supports an optional benchmark.
 - **Portfolio Tracker** — upload a holdings file (JSON/CSV) to see value, P&L,
   allocation, and an interactive fee-drag projection (adjust horizon and assumed
   return with sliders).
 
-A **Demo mode** toggle (on by default) generates synthetic data, so you can try
-the whole interface without any network access. Turn it off to use live data.
+Choose the **data source** in the sidebar:
+
+- **analizy.pl** (default) — Polish TFI funds. The symbols box starts with the
+  eight funds in `test_symbols_analizy.txt`; edit it or load your own list (one
+  symbol per line or a JSON list, as for `--symbols-file`), then press **Run
+  analysis**. The screening runs the CLI's own code: each fund is fetched once,
+  in parallel, and quotes are cached on disk for a day. Symbols that produce no
+  results are listed by name.
+- **Stooq** — needs an API key: enter it in the sidebar or set `STOOQ_APIKEY`.
+- **Demo** — synthetic funds, so you can try the interface without any network
+  access.
+
+The Portfolio Tracker prices holdings from analizy.pl (default) or Stooq; use
+that source's symbols in the holdings file.
 
 ## Usage
 

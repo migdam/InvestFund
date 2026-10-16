@@ -117,9 +117,10 @@ python analyze_polish_funds.py --provider analizy \
 ```bash
 streamlit run dashboard.py
 ```
-Opens a point-and-click UI in your browser. It starts in **Demo mode** (synthetic
-data) so you can explore without any network access — turn Demo mode off in the
-sidebar to use live data.
+Opens a point-and-click UI in your browser, set up for live analizy.pl data: the
+symbols box starts with the funds in `test_symbols_analizy.txt`, so press **Run
+analysis** (or paste or upload your own symbols first). Pick **Demo** as the data
+source to explore without network access.
 
 ### Compare Strategies
 ```bash

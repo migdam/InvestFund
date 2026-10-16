@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Offline efficiency benchmark for the analizy.pl path of analyze_polish_funds.
+Offline efficiency benchmark for the analizy.pl path of analyze_polish_funds
+and of the dashboard, which screens funds with the same code.
 
 Everything runs locally against bench/mock_analizy.py, so results do not
 depend on network access to analizy.pl and the third-party site is never hit.
@@ -14,13 +15,19 @@ e2e_cold_*            full CLI run (--provider analizy --symbols-file ...) with
 e2e_warm_*            the same run again, reusing the cache from the cold run
 requests_maxfunds5    requests made by a cold run with --max-funds 5 (its output
                       is checked against bench/golden_maxfunds5.json)
+ui_cold_s             the dashboard's live screening of the same symbols (Max
+                      funds 0, empty cache) through Streamlit's AppTest in a
+                      fresh process: time from clicking Run analysis until the
+                      page is rebuilt (excludes loading Streamlit itself)
+ui_requests_cold      requests made by that dashboard run
 parse_ms_per_fund     in-process JSON decode + AnalizyProvider.parse_payload
 compute_ms_per_fund   in-process FundAnalyzer.analyze_fund on parsed data
 
 Correctness guard
 -----------------
-Every run checks that computed metrics (in process and in the CLI's CSV) still
-match bench/golden.json. An optimization that changes any output fails.
+Every run checks that computed metrics (in process, in the CLI's CSV and in
+the dashboard's results table) still match bench/golden.json. An optimization
+that changes any output fails.
 
 Usage
 -----
@@ -63,10 +70,11 @@ import mock_analizy  # noqa: E402
 GOLDEN_SKIP_COLUMNS = {"return_ytd"}
 TIME_METRICS = [
     "cli_startup_s", "e2e_cold_s", "e2e_cold_cpu_s", "e2e_cold_rss_mb",
-    "e2e_warm_s", "parse_ms_per_fund", "compute_ms_per_fund",
+    "e2e_warm_s", "ui_cold_s", "parse_ms_per_fund", "compute_ms_per_fund",
 ]
 COUNT_METRICS = [
     "requests_cold", "connections_cold", "requests_warm", "requests_maxfunds5",
+    "ui_requests_cold",
 ]
 # Cheap, repeatable scenarios are compared on their fastest run (noise only
 # adds time, so best-of-N is stable while medians drift with machine load);
@@ -220,6 +228,29 @@ def run_cli(server, workdir: Path, symbols_file: Path, extra_args=()) -> dict:
         "requests": server.stats.requests,
         "connections": server.stats.connections,
         "csv": workdir / "out.csv",
+        "log": log_path,
+    }
+
+
+def run_ui(server, workdir: Path, symbols_file: Path) -> dict:
+    """One dashboard screening run in a fresh process, started in `workdir`."""
+    stats_path = workdir / "ui_stats.json"
+    log_path = workdir / "ui_stderr.log"
+    csv_path = workdir / "ui.csv"
+    cmd = [
+        sys.executable, str(BENCH_DIR / "_run_ui.py"),
+        server.url_template, str(stats_path), str(symbols_file), str(csv_path),
+    ]
+    server.stats.reset()
+    proc = subprocess.run(cmd, cwd=workdir, env=_env(), capture_output=True,
+                          text=True, timeout=600)
+    log_path.write_text(proc.stdout + proc.stderr)
+    stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
+    return {
+        "wall_s": stats.get("run_s"),
+        "exit_code": stats.get("exit_code", proc.returncode),
+        "requests": server.stats.requests,
+        "csv": csv_path,
         "log": log_path,
     }
 
@@ -405,6 +436,9 @@ def main() -> int:
                 workdir.mkdir()
                 problems += _check_csv(run_cli(server, workdir, maxfunds_file, maxfunds_args),
                                        golden_maxfunds, "cli --max-funds 5")
+                workdir = tmp / "golden_ui"
+                workdir.mkdir()
+                problems += _check_csv(run_ui(server, workdir, symbols_file), golden, "dashboard")
                 for p in problems[:20]:
                     print(f"GOLDEN MISMATCH {p}")
                 print("golden: PASS" if not problems else f"golden: FAIL ({len(problems)} mismatches)")
@@ -413,15 +447,20 @@ def main() -> int:
             print("Measuring CLI startup...", file=sys.stderr)
             metrics = {"cli_startup_s": time_cli_startup(args.startup_repeats)}
 
-            cold, warm = [], []
+            cold, warm, ui = [], [], []
             for i in range(args.repeats):
-                print(f"End-to-end run {i + 1}/{args.repeats} (cold + warm)...", file=sys.stderr)
+                print(f"End-to-end run {i + 1}/{args.repeats} (cold + warm + dashboard)...",
+                      file=sys.stderr)
                 workdir = tmp / f"e2e_{i}"
                 workdir.mkdir()
                 cold.append(run_cli(server, workdir, symbols_file))
                 problems += _check_csv(cold[-1], golden, f"cli cold run {i + 1}")
                 warm.append(run_cli(server, workdir, symbols_file))
                 problems += _check_csv(warm[-1], golden, f"cli warm run {i + 1}")
+                workdir = tmp / f"ui_{i}"
+                workdir.mkdir()
+                ui.append(run_ui(server, workdir, symbols_file))
+                problems += _check_csv(ui[-1], golden, f"dashboard run {i + 1}")
 
             maxfunds_dir = tmp / "maxfunds"
             maxfunds_dir.mkdir()
@@ -433,10 +472,12 @@ def main() -> int:
             "e2e_cold_cpu_s": _summary([r["cpu_s"] or 0.0 for r in cold]),
             "e2e_cold_rss_mb": _summary([r["rss_mb"] for r in cold]),
             "e2e_warm_s": _summary([r["wall_s"] for r in warm]),
+            "ui_cold_s": _summary([r["wall_s"] or 0.0 for r in ui]),
             "requests_cold": max(r["requests"] for r in cold),
             "connections_cold": max(r["connections"] for r in cold),
             "requests_warm": max(r["requests"] for r in warm),
             "requests_maxfunds5": maxfunds["requests"],
+            "ui_requests_cold": max(r["requests"] for r in ui),
         })
     metrics.update(time_parse_and_compute(payloads, args.repeats))
 
