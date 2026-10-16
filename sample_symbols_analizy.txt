@@ -1,0 +1,6 @@
+# analizy.pl fund symbols to screen, one per line.
+# Blank lines and lines starting with '#' are ignored.
+# Find a fund's symbol in its analizy.pl URL, e.g.
+#   https://www.analizy.pl/.../ING35  ->  ING35
+# Only ING35 below is verified against the live quotation API.
+ING35
