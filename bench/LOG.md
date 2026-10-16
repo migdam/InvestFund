@@ -6,6 +6,9 @@ reads this file first and appends to it last.
 - **Branch:** `claude/enhance-funds-analysis-017gvWUhpDKdUP1bNAL1w9vV` (PR #1)
 - **Start commit:** `e5d49e1` (benchmark frozen, app code unchanged)
 - **Iterations logged:** 9
+- **Benchmark changed:** 2026-10-16, dashboard scenario added at the user's
+  request (see *Benchmark changes*); `bench/baseline.json` re-recorded at
+  `426faf0`.
 
 ## Summary
 
@@ -50,25 +53,70 @@ would likely let iteration 7's parsing win through (~0.1 s); a faster JSON or
 DataFrame library (new dependency). What remains otherwise is mostly importing
 pandas (~0.3 s) and, in the mock, the simulated network.
 
+## Benchmark changes
+
+### 2026-10-16 — dashboard scenario added (approved by the user)
+The dashboard's live screening now runs the CLI's `screen_funds` (commit
+`426faf0`), so the user asked for it to be measured too. `bench/_run_ui.py`
+drives `dashboard.py` through Streamlit's AppTest in a fresh process against
+the mock: default load (no requests), the 40-symbol list, Max funds 0, Run
+analysis. New metrics: `ui_cold_s` (median of 3; from the click until the page
+is rebuilt, not counting loading Streamlit) and `ui_requests_cold`. Every run
+checks the dashboard's results table against `golden.json`, CI's
+`--golden-only` included. Rule 8 and the stop conditions in
+`EFFICIENCY_LOOP.md` now cover this run.
+
+Validation, on the code committed as `426faf0`:
+- A/A (same code measured twice): every metric noise or same, verdict
+  `REVERT (no significant improvement)`, so the new metrics give no false
+  verdicts.
+- Positive control, a naive integration (names fetched one by one with
+  `get_fund_list`, then every fund downloaded again by the 10-thread
+  analysis): `ui_cold_s` 1.18 → 4.16 s (+252%, WORSE), `ui_requests_cold`
+  40 → 79 (WORSE), every CLI metric unchanged; verdict REVERT. This is also
+  what the shared path is worth to the dashboard: about 3.5× faster and half
+  the requests.
+- Golden: making the dashboard ignore Max funds 0 (so it analyzes 30 funds)
+  fails the check with 30 mismatches, all labelled `dashboard`.
+
+Where a dashboard run's time goes (40 symbols, mock server in its own
+process): screening 0.75–0.86 s (fetch and parse 0.50–0.64 s, analysis
+0.20–0.27 s — the code the CLI runs), rebuilding the page 0.06–0.13 s. The
+first click in a fresh process also pays ~0.25 s for Streamlit's lazy import
+of Altair (its chart library); a long-running dashboard pays that once, the
+benchmark on every run. Speeding up the shared screening path therefore speeds
+up the dashboard by about as much.
+
+Noise: across three measurements `ui_cold_s` spread ±10–26%, so with 3 repeats
+only changes of roughly 20–50% register on it (see *Needs approval*).
+
 ## Baseline
 
-`bench/baseline.json`, recorded at `e5d49e1` in a cloud container (Linux
-x86_64, 4 CPUs, Python 3.11). Compare against these numbers only on that kind
-of machine; the loop itself always measures before and after back to back.
+`bench/baseline.json`, re-recorded at `426faf0` when the dashboard scenario
+was added, in a cloud container (Linux x86_64, 4 CPUs, Python 3.11). Compare
+against these numbers only on that kind of machine; the loop itself always
+measures before and after back to back.
 
 | metric | value | what it means |
 |---|---|---|
-| `cli_startup_s` | 2.22 s | `--help` in a fresh process (best of 7) |
-| `e2e_cold_s` | 8.73 s | full analizy run, 40 symbols, empty cache (median of 3) |
-| `e2e_cold_cpu_s` | 4.79 s | CPU time of that run |
-| `e2e_cold_rss_mb` | 251 MB | peak memory of that run |
-| `e2e_warm_s` | 7.43 s | same run again, cache populated |
-| `parse_ms_per_fund` | 8.7 ms | JSON decode + `parse_payload` (best of 9) |
-| `compute_ms_per_fund` | 7.0 ms | `analyze_fund` on parsed data (best of 9) |
-| `requests_cold` | 79 | requests for 39 resolvable symbols + one 404 |
-| `connections_cold` | 79 | new connections (no reuse at all) |
-| `requests_warm` | 40 | requests when everything is cached |
-| `requests_maxfunds5` | 45 | requests for a `--max-funds 5` run |
+| `cli_startup_s` | 0.42 s | `--help` in a fresh process (best of 7) |
+| `e2e_cold_s` | 1.24 s | full analizy run, 40 symbols, empty cache (median of 3) |
+| `e2e_cold_cpu_s` | 1.42 s | CPU time of that run |
+| `e2e_cold_rss_mb` | 149 MB | peak memory of that run |
+| `e2e_warm_s` | 0.82 s | same run again, cache populated |
+| `ui_cold_s` | 1.11 s | dashboard: Run analysis on the same 40 symbols, empty cache (median of 3) |
+| `parse_ms_per_fund` | 5.3 ms | JSON decode + `parse_payload` (best of 9) |
+| `compute_ms_per_fund` | 3.0 ms | `analyze_fund` on parsed data (best of 9) |
+| `requests_cold` | 40 | requests for 39 resolvable symbols + one 404 |
+| `connections_cold` | 10 | new connections (one per worker thread) |
+| `requests_warm` | 1 | requests when everything is cached (the 404 is asked again) |
+| `requests_maxfunds5` | 6 | requests for a `--max-funds 5` run |
+| `ui_requests_cold` | 40 | requests made by the dashboard run |
+
+The previous baseline, the loop's starting point `e5d49e1`, is in git history
+(`git show f3d5819:bench/baseline.json`): 2.22 s startup, 8.73 s cold run,
+4.79 s CPU, 251 MB, 7.43 s warm run, 8.7 / 7.0 ms parse / compute per fund,
+79 requests and 79 connections cold, 40 warm, 45 for `--max-funds 5`.
 
 The mock charges 60 ms per new connection and 40 ms per request; real
 analizy.pl costs will differ, but the direction of each change carries over.
@@ -107,7 +155,11 @@ Do not implement; the user decides.
   7 measured −17% CPU and −17% cold run and could not confirm either). Raising
   `--repeats` for the end-to-end scenarios (e.g. 3 → 7) would resolve smaller
   gains at about twice the time per iteration. The benchmark is frozen for the
-  loop, so this is your call.
+  loop, so this is your call. The dashboard's `ui_cold_s` (±10–26%) would
+  benefit the same way.
+- Dashboard charts on demand (e.g. behind a toggle): would save Streamlit's
+  ~0.25 s Altair import on the first run after the server starts. Changes the
+  page, so it is your call.
 - Stooq path, out of scope here: `download_quotes` retries immediately (no
   backoff) even on HTTP 4xx, sending requests that cannot succeed.
 
